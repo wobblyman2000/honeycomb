@@ -32,6 +32,8 @@ public:
 
     void setTracks(const QVector<Track>& tracks);
     void updateTrackRating(int64_t trackId, int rating);
+    void setAvailablePlaylists(const QVector<QPair<QString, QString>>& playlists) { m_playlists = playlists; }
+    void setActiveStaticPlaylistId(const QString& playlistId) { m_activePlaylistId = playlistId; }
 
 signals:
     void trackActivated(const QVector<honeycomb::Track>& queue, int startIndex);
@@ -40,12 +42,19 @@ signals:
     void trackRatingChanged(int64_t trackId, int rating);
     void findArtistRequested(const QString& artist);
     void findTrackRequested(const QString& title);
+    void editTagsRequested(const QVector<honeycomb::Track>& tracks);
+    void addToPlaylistRequested(const QString& playlistId, const QStringList& trackPaths);
+    void addToNewPlaylistRequested(const QStringList& trackPaths);
+    void removeFromPlaylistRequested(const QString& playlistId, int row);
+    void movePlaylistTrackRequested(const QString& playlistId, int fromRow, int toRow);
 
 protected:
     void contextMenuEvent(QContextMenuEvent* event) override;
 
 private:
     TrackTableModel* m_model = nullptr;
+    QVector<QPair<QString, QString>> m_playlists;
+    QString m_activePlaylistId;
 };
 
 } // namespace honeycomb

@@ -20,7 +20,8 @@ public:
         TrackCountRole,
         DiscCountRole,
         ArtHashRole,
-        IsCompilationRole
+        IsCompilationRole,
+        AlbumTypeRole
     };
 
     explicit AlbumGridModel(ArtCache* artCache, QObject* parent = nullptr);
@@ -60,6 +61,8 @@ public:
     void setAlbums(const QVector<Album>& albums);
     void setArtworkSize(int sizePx);
     int artworkSize() const { return m_artSize; }
+    void setAvailableAlbumTypes(const QStringList& types) { m_customAlbumTypes = types; }
+    void setAvailablePlaylists(const QVector<QPair<QString, QString>>& playlists) { m_playlists = playlists; }
 
 signals:
     void albumClicked(const honeycomb::Album& album);
@@ -67,6 +70,10 @@ signals:
     void albumPlayNextRequested(const honeycomb::Album& album);
     void albumQueueRequested(const honeycomb::Album& album);
     void findArtistRequested(const QString& artist);
+    void albumTypeChangeRequested(const honeycomb::Album& album, const QString& albumType);
+    void editAlbumTagsRequested(const honeycomb::Album& album);
+    void albumAddToPlaylistRequested(const honeycomb::Album& album, const QString& playlistId);
+    void albumAddToNewPlaylistRequested(const honeycomb::Album& album);
     void artworkSizeChanged(int newSizePx);
 
 protected:
@@ -77,6 +84,8 @@ private:
     ArtCache* m_artCache = nullptr;
     AlbumGridModel* m_model = nullptr;
     int m_artSize = 200;
+    QStringList m_customAlbumTypes;
+    QVector<QPair<QString, QString>> m_playlists;
 };
 
 } // namespace honeycomb

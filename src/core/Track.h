@@ -25,6 +25,7 @@ struct Track {
     int64_t dateAdded = 0; // Unix timestamp (seconds)
     int64_t lastPlayed = 0;
     bool isCompilation = false;
+    QString albumType;
     QString artHash;
 };
 
@@ -34,6 +35,7 @@ struct Album {
     int year = 0;
     QString genre;
     bool isCompilation = false;
+    QString albumType;
     int trackCount = 0;
     int discCount = 1;
     int64_t totalDurationMs = 0;

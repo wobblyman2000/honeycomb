@@ -75,7 +75,7 @@ TrackTableView::TrackTableView(QWidget* parent) : QTableView(parent) {
 
     verticalHeader()->setVisible(false);
     setSelectionBehavior(QAbstractItemView::SelectRows);
-    setSelectionMode(QAbstractItemView::SingleSelection);
+    setSelectionMode(QAbstractItemView::ExtendedSelection);
     setEditTriggers(QAbstractItemView::NoEditTriggers);
     setShowGrid(false);
     setAlternatingRowColors(true);
@@ -121,6 +121,26 @@ void TrackTableView::contextMenuEvent(QContextMenuEvent* event) {
     QAction* playAct = menu.addAction("Play Track");
     QAction* playNextAct = menu.addAction("Play Next");
     QAction* queueAct = menu.addAction("Add to Queue");
+    QMenu* plMenu = menu.addMenu("Add to Playlist");
+    QVector<QPair<QAction*, QString>> plActions;
+    for (const auto& pl : m_playlists) {
+        plActions.append({plMenu->addAction(pl.second), pl.first});
+    }
+    if (!m_playlists.isEmpty()) plMenu->addSeparator();
+    QAction* newPlAct = plMenu->addAction("New Playlist...");
+
+    QAction* moveUpAct = nullptr;
+    QAction* moveDownAct = nullptr;
+    QAction* removeFromPlAct = nullptr;
+    if (!m_activePlaylistId.isEmpty()) {
+        menu.addSeparator();
+        moveUpAct = menu.addAction("Move Up");
+        moveUpAct->setEnabled(idx.row() > 0);
+        moveDownAct = menu.addAction("Move Down");
+        moveDownAct->setEnabled(idx.row() + 1 < m_model->tracks().size());
+        removeFromPlAct = menu.addAction("Remove from Playlist");
+    }
+
     QMenu* rateMenu = menu.addMenu("Set Rating");
     QAction* rateActs[6]{};
     rateActs[0] = rateMenu->addAction("Clear Rating");
@@ -128,21 +148,58 @@ void TrackTableView::contextMenuEvent(QContextMenuEvent* event) {
         rateActs[r] = rateMenu->addAction(QString("★").repeated(r));
     }
     menu.addSeparator();
+    QVector<Track> selectedTracks;
+    QStringList selectedPaths;
+    const auto selectedRows = selectionModel() ? selectionModel()->selectedRows() : QModelIndexList{};
+    for (const QModelIndex& s : selectedRows) {
+        if (s.row() >= 0 && s.row() < m_model->tracks().size()) {
+            const Track& st = m_model->tracks().at(s.row());
+            selectedTracks.append(st);
+            selectedPaths.append(st.path);
+        }
+    }
+    if (selectedTracks.isEmpty()) {
+        selectedTracks.append(t);
+        selectedPaths.append(t.path);
+    }
+
+    QAction* editTagsAct = menu.addAction(
+        selectedTracks.size() > 1
+            ? QString("Edit Tags (%1 tracks)...").arg(selectedTracks.size())
+            : QString("Edit Tags..."));
+    menu.addSeparator();
     QAction* findArtistAct = !t.artist.isEmpty() ? menu.addAction(QString("Find Artist: %1").arg(t.artist)) : nullptr;
     QAction* findTrackAct = !t.title.isEmpty() ? menu.addAction(QString("Find Track: %1").arg(t.title)) : nullptr;
 
     QAction* chosen = menu.exec(event->globalPos());
+    if (!chosen) return;
     if (chosen == playAct) {
         emit trackActivated(m_model->tracks(), idx.row());
     } else if (chosen == playNextAct) {
         emit trackPlayNextRequested(t);
     } else if (chosen == queueAct) {
         emit trackQueueRequested(t);
+    } else if (chosen == newPlAct) {
+        emit addToNewPlaylistRequested(selectedPaths);
+    } else if (moveUpAct && chosen == moveUpAct) {
+        emit movePlaylistTrackRequested(m_activePlaylistId, idx.row(), idx.row() - 1);
+    } else if (moveDownAct && chosen == moveDownAct) {
+        emit movePlaylistTrackRequested(m_activePlaylistId, idx.row(), idx.row() + 1);
+    } else if (removeFromPlAct && chosen == removeFromPlAct) {
+        emit removeFromPlaylistRequested(m_activePlaylistId, idx.row());
+    } else if (chosen == editTagsAct) {
+        emit editTagsRequested(selectedTracks);
     } else if (findArtistAct && chosen == findArtistAct) {
         emit findArtistRequested(t.artist);
     } else if (findTrackAct && chosen == findTrackAct) {
         emit findTrackRequested(t.title);
     } else {
+        for (const auto& pair : plActions) {
+            if (chosen == pair.first) {
+                emit addToPlaylistRequested(pair.second, selectedPaths);
+                return;
+            }
+        }
         for (int r = 0; r <= 5; ++r) {
             if (chosen == rateActs[r]) {
                 emit trackRatingChanged(t.id, r);

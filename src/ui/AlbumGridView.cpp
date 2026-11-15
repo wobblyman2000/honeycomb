@@ -1,6 +1,7 @@
 #include "AlbumGridView.h"
 
 #include <QContextMenuEvent>
+#include <QInputDialog>
 #include <QMenu>
 #include <QPainter>
 #include <QPainterPath>
@@ -51,6 +52,7 @@ QVariant AlbumGridModel::data(const QModelIndex& index, int role) const {
     case DiscCountRole: return a.discCount;
     case ArtHashRole: return a.artHash;
     case IsCompilationRole: return a.isCompilation;
+    case AlbumTypeRole: return a.albumType;
     case Qt::DecorationRole: return m_artCache->getArtwork(a.artHash, m_artSize);
     default: return {};
     }
@@ -119,6 +121,23 @@ void AlbumGridDelegate::paint(QPainter* painter, const QStyleOptionViewItem& opt
         painter->drawRoundedRect(bRect, 5, 5);
         painter->setPen(QColor("#f5a623"));
         painter->drawText(bRect, Qt::AlignCenter, badge);
+    }
+
+    const QString albumType = index.data(AlbumGridModel::AlbumTypeRole).toString();
+    if (!albumType.isEmpty()) {
+        QFont tFont = option.font;
+        tFont.setPointSizeF(tFont.pointSizeF() * 0.76);
+        tFont.setBold(true);
+        painter->setFont(tFont);
+        const int maxW = discCount > 1 ? (artRect.width() - 68) : (artRect.width() - 12);
+        const QString elidedBadge = QFontMetrics(tFont).elidedText(albumType, Qt::ElideRight, qMax(30, maxW - 12));
+        const int tw = qMin(maxW, QFontMetrics(tFont).horizontalAdvance(elidedBadge) + 12);
+        const QRect tRect(artRect.left() + 6, artRect.top() + 6, tw, 18);
+        painter->setBrush(QColor(16, 17, 22, 210));
+        painter->setPen(QPen(QColor("#7dd3fc"), 1));
+        painter->drawRoundedRect(tRect, 5, 5);
+        painter->setPen(QColor("#7dd3fc"));
+        painter->drawText(tRect, Qt::AlignCenter, elidedBadge);
     }
 
     // Title
@@ -210,20 +229,78 @@ void AlbumGridView::contextMenuEvent(QContextMenuEvent* event) {
     QAction* playAct = menu.addAction("Play Album");
     QAction* playNextAct = menu.addAction("Play Album Next");
     QAction* queueAct = menu.addAction("Add Album to Queue");
+
+    QMenu* plMenu = menu.addMenu("Add Album to Playlist");
+    QVector<QPair<QAction*, QString>> plActions;
+    for (const auto& pl : m_playlists) {
+        plActions.append({plMenu->addAction(pl.second), pl.first});
+    }
+    if (!m_playlists.isEmpty()) plMenu->addSeparator();
+    QAction* newPlAct = plMenu->addAction("New Playlist...");
+
+    QAction* editTagsAct = menu.addAction("Edit Album Tags...");
+
+    QMenu* typeMenu = menu.addMenu("Set Album Type");
+    QStringList presets = {"Studio", "Live", "EP", "Single", "Compilation", "Soundtrack", "Remix"};
+    for (const QString& custom : m_customAlbumTypes) {
+        if (!presets.contains(custom, Qt::CaseInsensitive)) {
+            presets.append(custom);
+        }
+    }
+    QVector<QPair<QAction*, QString>> typeActions;
+    for (const QString& p : presets) {
+        QAction* act = typeMenu->addAction(p);
+        act->setCheckable(true);
+        act->setChecked(a->albumType.compare(p, Qt::CaseInsensitive) == 0);
+        typeActions.append({act, p});
+    }
+    typeMenu->addSeparator();
+    QAction* customTypeAct = typeMenu->addAction("Custom...");
+    QAction* clearTypeAct = typeMenu->addAction("Clear Album Type");
+
     QAction* findArtistAct = nullptr;
     if (!a->albumArtist.isEmpty() && a->albumArtist != "Various Artists") {
         menu.addSeparator();
         findArtistAct = menu.addAction(QString("Find Artist: %1").arg(a->albumArtist));
     }
     QAction* chosen = menu.exec(event->globalPos());
+    if (!chosen) return;
     if (chosen == playAct) {
         emit albumActivated(*a);
     } else if (chosen == playNextAct) {
         emit albumPlayNextRequested(*a);
     } else if (chosen == queueAct) {
         emit albumQueueRequested(*a);
+    } else if (chosen == newPlAct) {
+        emit albumAddToNewPlaylistRequested(*a);
+    } else if (chosen == editTagsAct) {
+        emit editAlbumTagsRequested(*a);
+    } else if (chosen == customTypeAct) {
+        bool ok = false;
+        const QString text = QInputDialog::getText(
+            this, "Custom Album Type",
+            QString("Enter album type / tag for \"%1\":").arg(a->album),
+            QLineEdit::Normal, a->albumType, &ok);
+        if (ok) {
+            emit albumTypeChangeRequested(*a, text.trimmed());
+        }
+    } else if (chosen == clearTypeAct) {
+        emit albumTypeChangeRequested(*a, QString());
     } else if (findArtistAct && chosen == findArtistAct) {
         emit findArtistRequested(a->albumArtist);
+    } else {
+        for (const auto& pair : plActions) {
+            if (chosen == pair.first) {
+                emit albumAddToPlaylistRequested(*a, pair.second);
+                return;
+            }
+        }
+        for (const auto& pair : typeActions) {
+            if (chosen == pair.first) {
+                emit albumTypeChangeRequested(*a, pair.second);
+                break;
+            }
+        }
     }
 }
 

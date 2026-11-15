@@ -27,10 +27,19 @@ add_executable(honeycomb
     src/ui/ArtCache.cpp
     src/ui/ColumnBrowser.cpp
     src/ui/StarRatingWidget.h
+    src/ui/LyricsReader.h
+    src/ui/TheaterWindow.h
+    src/ui/TheaterWindow.cpp
+    src/ui/MiniPlayerWindow.h
+    src/ui/MiniPlayerWindow.cpp
     src/ui/AlbumGridView.cpp
     src/ui/AlbumTracksView.cpp
     src/ui/TrackTableView.cpp
     src/ui/RuleBuilderDialog.cpp
+    src/ui/AutoDjDialog.h
+    src/ui/AutoDjDialog.cpp
+    src/ui/TagEditorDialog.h
+    src/ui/TagEditorDialog.cpp
     src/ui/MainWindow.cpp
 )
 

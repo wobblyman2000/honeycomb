@@ -4,6 +4,7 @@
 #include "core/Track.h"
 
 #include <QMutex>
+#include <QSet>
 #include <QString>
 #include <QStringList>
 #include <QVector>
@@ -29,9 +30,15 @@ public:
 
     // Tracks
     bool upsertTracks(const QVector<Track>& tracks);
+    bool updateTracksTags(const QVector<Track>& tracks);
+    int pruneMissingTracks(const QSet<QString>& seenPaths,
+                           const QStringList& configuredFolders,
+                           const QStringList& scannedRoots);
     int trackCount() const;
     void incrementPlayCount(const QString& path);
     void setTrackRating(int64_t trackId, int rating);
+    bool setAlbumType(const QString& album, const QString& albumArtist, bool isCompilation, const QString& albumType);
+    QStringList distinctAlbumTypes() const;
 
     // Queries
     QVector<Album> queryAlbums(const RuleGroup& rules,
@@ -50,6 +57,21 @@ public:
     QVector<Collection> loadCollections() const;
     bool saveCollection(const Collection& col);
     bool deleteCollection(const QString& id);
+
+    // Static Playlists
+    struct Playlist {
+        QString id;
+        QString name;
+        int trackCount = 0;
+    };
+    QVector<Playlist> loadPlaylists() const;
+    bool createPlaylist(const QString& id, const QString& name);
+    bool renamePlaylist(const QString& id, const QString& newName);
+    bool deletePlaylist(const QString& id);
+    bool addTracksToPlaylist(const QString& playlistId, const QStringList& trackPaths);
+    bool removeTrackFromPlaylist(const QString& playlistId, int position);
+    bool movePlaylistTrack(const QString& playlistId, int fromPos, int toPos);
+    QVector<Track> queryPlaylistTracks(const QString& playlistId, const QString& searchText = QString()) const;
 
 private:
     bool initSchema();

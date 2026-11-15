@@ -13,6 +13,7 @@ enum class FilterField {
     Artist,
     AlbumArtist,
     Album,
+    AlbumType,
     Genre,
     Year,
     Format,

@@ -5,6 +5,7 @@
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QSet>
 #include <QtConcurrent>
 
 #include <taglib/fileref.h>
@@ -118,6 +119,24 @@ Track scanFile(const QFileInfo& fi, const QString& artCacheDir, QHash<QString, Q
         t.isCompilation = true;
     }
 
+    for (const char* key : {"RELEASETYPE", "ALBUMTYPE", "MUSICBRAINZ_ALBUMTYPE"}) {
+        if (props.contains(key) && !props[key].isEmpty()) {
+            const QString raw = QString::fromStdWString(props[key].front().toWString()).trimmed();
+            if (!raw.isEmpty()) {
+                const QString low = raw.toLower();
+                if (low == "album" || low == "studio") t.albumType = "Studio";
+                else if (low == "live" || low == "live album") t.albumType = "Live";
+                else if (low == "ep") t.albumType = "EP";
+                else if (low == "single") t.albumType = "Single";
+                else if (low == "compilation") t.albumType = "Compilation";
+                else if (low == "soundtrack") t.albumType = "Soundtrack";
+                else if (low == "remix") t.albumType = "Remix";
+                else t.albumType = raw;
+                break;
+            }
+        }
+    }
+
     if (props.contains("DISCNUMBER")) {
         const QString discStr = QString::fromStdWString(props["DISCNUMBER"].front().toWString());
         const int slash = discStr.indexOf('/');
@@ -156,6 +175,22 @@ Track scanFile(const QFileInfo& fi, const QString& artCacheDir, QHash<QString, Q
 LibraryScanner::LibraryScanner(Database* db, const QString& artCacheDir, QObject* parent)
     : QObject(parent), m_db(db), m_artCacheDir(artCacheDir) {
     QDir().mkpath(m_artCacheDir);
+
+    m_watcher = new QFileSystemWatcher(this);
+    m_watchDebounceTimer = new QTimer(this);
+    m_watchDebounceTimer->setSingleShot(true);
+    m_watchDebounceTimer->setInterval(1500);
+
+    connect(m_watcher, &QFileSystemWatcher::directoryChanged, this, [this](const QString&) {
+        if (m_autoWatchEnabled && !m_scanning.load() && !m_watchedFolders.isEmpty()) {
+            m_watchDebounceTimer->start();
+        }
+    });
+    connect(m_watchDebounceTimer, &QTimer::timeout, this, [this]() {
+        if (m_autoWatchEnabled && !m_scanning.load() && !m_watchedFolders.isEmpty()) {
+            startScan(m_watchedFolders);
+        }
+    });
 }
 
 LibraryScanner::~LibraryScanner() {
@@ -164,6 +199,39 @@ LibraryScanner::~LibraryScanner() {
 
 void LibraryScanner::cancel() {
     m_cancel.store(true);
+}
+
+void LibraryScanner::setAutoWatchEnabled(bool enabled) {
+    m_autoWatchEnabled = enabled;
+    refreshWatcher();
+}
+
+void LibraryScanner::watchFolders(const QStringList& folders) {
+    m_watchedFolders = folders;
+    refreshWatcher();
+}
+
+void LibraryScanner::refreshWatcher() {
+    const QStringList existing = m_watcher->directories();
+    if (!existing.isEmpty()) {
+        m_watcher->removePaths(existing);
+    }
+    if (!m_autoWatchEnabled || m_watchedFolders.isEmpty()) return;
+
+    QStringList dirsToWatch;
+    const int maxDirs = 2000;
+    for (const QString& root : m_watchedFolders) {
+        if (!QDir(root).exists()) continue;
+        dirsToWatch.append(root);
+        QDirIterator it(root, QDir::Dirs | QDir::NoDotAndDotDot, QDirIterator::Subdirectories);
+        while (it.hasNext() && dirsToWatch.size() < maxDirs) {
+            dirsToWatch.append(it.next());
+        }
+        if (dirsToWatch.size() >= maxDirs) break;
+    }
+    if (!dirsToWatch.isEmpty()) {
+        m_watcher->addPaths(dirsToWatch);
+    }
 }
 
 void LibraryScanner::startScan(const QStringList& folders) {
@@ -176,15 +244,21 @@ void LibraryScanner::startScan(const QStringList& folders) {
         batch.reserve(100);
         int totalCount = 0;
         QHash<QString, QString> dirArtCache;
+        QSet<QString> seenPaths;
+        QStringList scannedRoots;
 
         for (const QString& root : folders) {
             if (m_cancel.load()) break;
+            if (!QDir(root).exists()) continue;
+            scannedRoots.append(root);
+
             QDirIterator it(root, QDir::Files, QDirIterator::Subdirectories);
             while (it.hasNext() && !m_cancel.load()) {
                 it.next();
                 const QFileInfo fi = it.fileInfo();
                 if (!isAudioExtension(fi.suffix())) continue;
 
+                seenPaths.insert(fi.absoluteFilePath());
                 batch.append(scanFile(fi, m_artCacheDir, dirArtCache));
                 ++totalCount;
 
@@ -202,8 +276,13 @@ void LibraryScanner::startScan(const QStringList& folders) {
             m_db->upsertTracks(batch);
         }
 
+        if (!m_cancel.load()) {
+            m_db->pruneMissingTracks(seenPaths, folders, scannedRoots);
+        }
+
         m_scanning.store(false);
-        QMetaObject::invokeMethod(this, [this, totalCount]() {
+        QMetaObject::invokeMethod(this, [this, totalCount, folders]() {
+            watchFolders(folders);
             emit scanFinished(totalCount);
         }, Qt::QueuedConnection);
     });

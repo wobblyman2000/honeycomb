@@ -79,9 +79,12 @@ RuleBuilderDialog::RuleBuilderDialog(const Collection& initial, QWidget* parent)
 
     m_sortCombo = new QComboBox(viewGroup);
     m_sortCombo->addItem("Album Artist / Year", static_cast<int>(SortOrder::AlbumArtistYear));
+    m_sortCombo->addItem("Album Artist / Album Type / Year", static_cast<int>(SortOrder::AlbumArtistTypeYear));
+    m_sortCombo->addItem("Album Type / Artist / Year", static_cast<int>(SortOrder::AlbumTypeYear));
     m_sortCombo->addItem("Album Title", static_cast<int>(SortOrder::AlbumTitle));
     m_sortCombo->addItem("Year (Newest First)", static_cast<int>(SortOrder::YearDesc));
     m_sortCombo->addItem("Recently Added", static_cast<int>(SortOrder::RecentlyAdded));
+    m_sortCombo->addItem("Recently Played", static_cast<int>(SortOrder::RecentlyPlayed));
     m_sortCombo->addItem("Track Title", static_cast<int>(SortOrder::TrackTitle));
     m_sortCombo->setCurrentIndex(static_cast<int>(initial.sortOrder));
 

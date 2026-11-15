@@ -2,6 +2,8 @@
 
 #include <QDateTime>
 #include <QDebug>
+#include <QDir>
+#include <QFileInfo>
 #include <QJsonDocument>
 
 namespace honeycomb {
@@ -26,6 +28,22 @@ QString colText(sqlite3_stmt* stmt, int col) {
     return txt ? QString::fromUtf8(reinterpret_cast<const char*>(txt)) : QString();
 }
 
+QString albumTypeRankExpr(const QString& typeCol, const QString& compCol) {
+    return QString(
+        "CASE LOWER(COALESCE(NULLIF(%1, ''), CASE WHEN %2 = 1 THEN 'compilation' ELSE 'studio' END)) "
+        "WHEN 'studio' THEN 1 "
+        "WHEN 'album' THEN 1 "
+        "WHEN 'live' THEN 2 "
+        "WHEN 'live album' THEN 2 "
+        "WHEN 'ep' THEN 3 "
+        "WHEN 'single' THEN 4 "
+        "WHEN 'compilation' THEN 5 "
+        "WHEN 'soundtrack' THEN 6 "
+        "WHEN 'remix' THEN 7 "
+        "ELSE 8 END"
+    ).arg(typeCol, compCol);
+}
+
 QString orderByForAlbums(SortOrder order) {
     switch (order) {
     case SortOrder::AlbumArtistYear:
@@ -38,6 +56,14 @@ QString orderByForAlbums(SortOrder order) {
         return "ORDER BY MAX(date_added) DESC, LOWER(album)";
     case SortOrder::TrackTitle:
         return "ORDER BY LOWER(album)";
+    case SortOrder::AlbumArtistTypeYear:
+        return QString("ORDER BY LOWER(COALESCE(NULLIF(album_artist, ''), artist)), %1, LOWER(MAX(album_type)), year ASC, LOWER(album)")
+            .arg(albumTypeRankExpr("MAX(album_type)", "MAX(is_compilation)"));
+    case SortOrder::AlbumTypeYear:
+        return QString("ORDER BY %1, LOWER(MAX(album_type)), LOWER(COALESCE(NULLIF(album_artist, ''), artist)), year ASC, LOWER(album)")
+            .arg(albumTypeRankExpr("MAX(album_type)", "MAX(is_compilation)"));
+    case SortOrder::RecentlyPlayed:
+        return "ORDER BY MAX(last_played) DESC, LOWER(album)";
     }
     return "ORDER BY LOWER(album)";
 }
@@ -54,6 +80,14 @@ QString orderByForTracks(SortOrder order) {
         return "ORDER BY date_added DESC, LOWER(album), disc_number ASC, track_number ASC";
     case SortOrder::TrackTitle:
         return "ORDER BY LOWER(title)";
+    case SortOrder::AlbumArtistTypeYear:
+        return QString("ORDER BY LOWER(COALESCE(NULLIF(album_artist, ''), artist)), %1, LOWER(album_type), year ASC, LOWER(album), disc_number ASC, track_number ASC, LOWER(title)")
+            .arg(albumTypeRankExpr("album_type", "is_compilation"));
+    case SortOrder::AlbumTypeYear:
+        return QString("ORDER BY %1, LOWER(album_type), LOWER(COALESCE(NULLIF(album_artist, ''), artist)), year ASC, LOWER(album), disc_number ASC, track_number ASC, LOWER(title)")
+            .arg(albumTypeRankExpr("album_type", "is_compilation"));
+    case SortOrder::RecentlyPlayed:
+        return "ORDER BY last_played DESC, LOWER(album), disc_number ASC, track_number ASC";
     }
     return "ORDER BY LOWER(album), disc_number ASC, track_number ASC";
 }
@@ -112,6 +146,7 @@ bool Database::initSchema() {
             date_added INTEGER NOT NULL DEFAULT 0,
             last_played INTEGER NOT NULL DEFAULT 0,
             is_compilation INTEGER NOT NULL DEFAULT 0,
+            album_type TEXT NOT NULL DEFAULT '',
             art_hash TEXT NOT NULL DEFAULT ''
         );
 
@@ -128,6 +163,19 @@ bool Database::initSchema() {
             sort_index INTEGER NOT NULL DEFAULT 0,
             json_data TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS playlists (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            sort_index INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS playlist_tracks (
+            playlist_id TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            track_path TEXT NOT NULL,
+            PRIMARY KEY (playlist_id, position)
+        );
     )SQL";
 
     char* err = nullptr;
@@ -136,24 +184,32 @@ bool Database::initSchema() {
         sqlite3_free(err);
         return false;
     }
+
+    // Migrate existing databases that lack album_type
+    bool hasAlbumType = false;
+    sqlite3_stmt* pragmaStmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, "PRAGMA table_info(tracks)", -1, &pragmaStmt, nullptr) == SQLITE_OK) {
+        while (sqlite3_step(pragmaStmt) == SQLITE_ROW) {
+            if (colText(pragmaStmt, 1) == "album_type") {
+                hasAlbumType = true;
+                break;
+            }
+        }
+        sqlite3_finalize(pragmaStmt);
+    }
+    if (!hasAlbumType) {
+        sqlite3_exec(m_db, "ALTER TABLE tracks ADD COLUMN album_type TEXT NOT NULL DEFAULT '';", nullptr, nullptr, nullptr);
+    }
+    sqlite3_exec(m_db, "CREATE INDEX IF NOT EXISTS idx_tracks_album_type ON tracks(album_type);", nullptr, nullptr, nullptr);
+
     return true;
 }
 
 void Database::seedDefaultCollections() {
-    sqlite3_stmt* checkStmt = nullptr;
-    int count = 0;
-    if (sqlite3_prepare_v2(m_db, "SELECT COUNT(*) FROM collections", -1, &checkStmt, nullptr) == SQLITE_OK) {
-        if (sqlite3_step(checkStmt) == SQLITE_ROW) {
-            count = sqlite3_column_int(checkStmt, 0);
-        }
-        sqlite3_finalize(checkStmt);
-    }
-    if (count > 0) return;
-
     auto insertCol = [&](int idx, const Collection& col) {
         const QByteArray json = QJsonDocument(col.toJson()).toJson(QJsonDocument::Compact);
         sqlite3_stmt* stmt = nullptr;
-        if (sqlite3_prepare_v2(m_db, "INSERT INTO collections (id, sort_index, json_data) VALUES (?, ?, ?)", -1, &stmt, nullptr) == SQLITE_OK) {
+        if (sqlite3_prepare_v2(m_db, "INSERT OR IGNORE INTO collections (id, sort_index, json_data) VALUES (?, ?, ?)", -1, &stmt, nullptr) == SQLITE_OK) {
             const QByteArray idUtf8 = col.id.toUtf8();
             sqlite3_bind_text(stmt, 1, idUtf8.constData(), idUtf8.size(), SQLITE_TRANSIENT);
             sqlite3_bind_int(stmt, 2, idx);
@@ -163,30 +219,50 @@ void Database::seedDefaultCollections() {
         }
     };
 
-    Collection allMusic;
-    allMusic.id = "sys_all_music";
-    allMusic.name = "All Music";
-    allMusic.isSystem = true;
-    allMusic.viewMode = ViewMode::AlbumCovers;
-    allMusic.artworkSize = 200;
-    insertCol(0, allMusic);
+    sqlite3_stmt* checkStmt = nullptr;
+    int count = 0;
+    if (sqlite3_prepare_v2(m_db, "SELECT COUNT(*) FROM collections", -1, &checkStmt, nullptr) == SQLITE_OK) {
+        if (sqlite3_step(checkStmt) == SQLITE_ROW) {
+            count = sqlite3_column_int(checkStmt, 0);
+        }
+        sqlite3_finalize(checkStmt);
+    }
 
-    Collection variousArtists;
-    variousArtists.id = "sys_various_artists";
-    variousArtists.name = "Various Artists";
-    variousArtists.isSystem = true;
-    variousArtists.viewMode = ViewMode::AlbumCovers;
-    variousArtists.rules.conditions.append({FilterField::IsCompilation, FilterOp::IsTrue, ""});
-    insertCol(1, variousArtists);
+    if (count == 0) {
+        Collection allMusic;
+        allMusic.id = "sys_all_music";
+        allMusic.name = "All Music";
+        allMusic.isSystem = true;
+        allMusic.viewMode = ViewMode::AlbumCovers;
+        allMusic.artworkSize = 200;
+        insertCol(0, allMusic);
 
-    Collection recent;
-    recent.id = "sys_recent";
-    recent.name = "Recently Added";
-    recent.isSystem = true;
-    recent.viewMode = ViewMode::AlbumCovers;
-    recent.sortOrder = SortOrder::RecentlyAdded;
-    recent.rules.conditions.append({FilterField::DateAddedDaysAgo, FilterOp::LessOrEqual, "30"});
-    insertCol(2, recent);
+        Collection variousArtists;
+        variousArtists.id = "sys_various_artists";
+        variousArtists.name = "Various Artists";
+        variousArtists.isSystem = true;
+        variousArtists.viewMode = ViewMode::AlbumCovers;
+        variousArtists.rules.conditions.append({FilterField::IsCompilation, FilterOp::IsTrue, ""});
+        insertCol(1, variousArtists);
+
+        Collection recent;
+        recent.id = "sys_recent";
+        recent.name = "Recently Added";
+        recent.isSystem = true;
+        recent.viewMode = ViewMode::AlbumCovers;
+        recent.sortOrder = SortOrder::RecentlyAdded;
+        recent.rules.conditions.append({FilterField::DateAddedDaysAgo, FilterOp::LessOrEqual, "30"});
+        insertCol(2, recent);
+    }
+
+    Collection recentlyPlayed;
+    recentlyPlayed.id = "sys_recently_played";
+    recentlyPlayed.name = "Recently Played";
+    recentlyPlayed.isSystem = true;
+    recentlyPlayed.viewMode = ViewMode::TracksTable;
+    recentlyPlayed.sortOrder = SortOrder::RecentlyPlayed;
+    recentlyPlayed.rules.conditions.append({FilterField::PlayCount, FilterOp::GreaterThan, "0"});
+    insertCol(3, recentlyPlayed);
 }
 
 QStringList Database::libraryFolders() const {
@@ -237,8 +313,8 @@ bool Database::upsertTracks(const QVector<Track>& tracks) {
         INSERT INTO tracks (
             path, title, artist, album_artist, album, genre, year,
             track_number, disc_number, duration_ms, bitrate, sample_rate,
-            format, date_added, is_compilation, art_hash
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            format, date_added, is_compilation, album_type, art_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             title = excluded.title,
             artist = excluded.artist,
@@ -253,6 +329,7 @@ bool Database::upsertTracks(const QVector<Track>& tracks) {
             sample_rate = excluded.sample_rate,
             format = excluded.format,
             is_compilation = excluded.is_compilation,
+            album_type = CASE WHEN excluded.album_type != '' THEN excluded.album_type ELSE tracks.album_type END,
             art_hash = CASE WHEN excluded.art_hash != '' THEN excluded.art_hash ELSE tracks.art_hash END;
     )SQL";
 
@@ -287,7 +364,8 @@ bool Database::upsertTracks(const QVector<Track>& tracks) {
         bindStr(13, t.format);
         sqlite3_bind_int64(stmt, 14, t.dateAdded > 0 ? t.dateAdded : now);
         sqlite3_bind_int(stmt, 15, t.isCompilation ? 1 : 0);
-        bindStr(16, t.artHash);
+        bindStr(16, t.albumType);
+        bindStr(17, t.artHash);
 
         sqlite3_step(stmt);
     }
@@ -295,6 +373,127 @@ bool Database::upsertTracks(const QVector<Track>& tracks) {
     sqlite3_finalize(stmt);
     sqlite3_exec(m_db, "COMMIT;", nullptr, nullptr, nullptr);
     return true;
+}
+
+bool Database::updateTracksTags(const QVector<Track>& tracks) {
+    if (tracks.isEmpty()) return true;
+    QMutexLocker lock(&m_mutex);
+
+    sqlite3_exec(m_db, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
+    const char* sql = R"SQL(
+        UPDATE tracks SET
+            title = ?,
+            artist = ?,
+            album_artist = ?,
+            album = ?,
+            genre = ?,
+            year = ?,
+            track_number = ?,
+            disc_number = ?,
+            is_compilation = ?,
+            album_type = ?,
+            art_hash = ?
+        WHERE id = ?;
+    )SQL";
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        sqlite3_exec(m_db, "ROLLBACK;", nullptr, nullptr, nullptr);
+        return false;
+    }
+
+    for (const auto& t : tracks) {
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+
+        auto bindStr = [&](int idx, const QString& s) {
+            const QByteArray utf8 = s.toUtf8();
+            sqlite3_bind_text(stmt, idx, utf8.constData(), utf8.size(), SQLITE_TRANSIENT);
+        };
+
+        bindStr(1, t.title);
+        bindStr(2, t.artist);
+        bindStr(3, t.albumArtist);
+        bindStr(4, t.album);
+        bindStr(5, t.genre);
+        sqlite3_bind_int(stmt, 6, t.year);
+        sqlite3_bind_int(stmt, 7, t.trackNumber);
+        sqlite3_bind_int(stmt, 8, t.discNumber);
+        sqlite3_bind_int(stmt, 9, t.isCompilation ? 1 : 0);
+        bindStr(10, t.albumType);
+        bindStr(11, t.artHash);
+        sqlite3_bind_int64(stmt, 12, t.id);
+
+        sqlite3_step(stmt);
+    }
+
+    sqlite3_finalize(stmt);
+    sqlite3_exec(m_db, "COMMIT;", nullptr, nullptr, nullptr);
+    return true;
+}
+
+int Database::pruneMissingTracks(const QSet<QString>& seenPaths,
+                                 const QStringList& configuredFolders,
+                                 const QStringList& scannedRoots) {
+    QMutexLocker lock(&m_mutex);
+
+    QSet<QString> scannedClean;
+    for (const QString& root : scannedRoots) {
+        scannedClean.insert(QDir::cleanPath(root));
+    }
+
+    QStringList unmountedFolders;
+    for (const QString& folder : configuredFolders) {
+        const QString clean = QDir::cleanPath(folder);
+        if (!scannedClean.contains(clean)) {
+            unmountedFolders.append(clean);
+        }
+    }
+
+    auto isUnderUnmounted = [&](const QString& trackPath) -> bool {
+        for (const QString& folder : unmountedFolders) {
+            if (folder == "/" || trackPath == folder || trackPath.startsWith(folder + '/')) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    QVector<int64_t> toDelete;
+    sqlite3_stmt* selectStmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, "SELECT id, path FROM tracks", -1, &selectStmt, nullptr) != SQLITE_OK) {
+        return 0;
+    }
+    while (sqlite3_step(selectStmt) == SQLITE_ROW) {
+        const int64_t id = sqlite3_column_int64(selectStmt, 0);
+        const QString path = colText(selectStmt, 1);
+        if (!seenPaths.contains(path) && !isUnderUnmounted(path)) {
+            toDelete.append(id);
+        }
+    }
+    sqlite3_finalize(selectStmt);
+
+    if (toDelete.isEmpty()) return 0;
+
+    sqlite3_exec(m_db, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
+    sqlite3_stmt* delStmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, "DELETE FROM tracks WHERE id = ?", -1, &delStmt, nullptr) != SQLITE_OK) {
+        sqlite3_exec(m_db, "ROLLBACK;", nullptr, nullptr, nullptr);
+        return 0;
+    }
+
+    int deletedCount = 0;
+    for (int64_t id : toDelete) {
+        sqlite3_reset(delStmt);
+        sqlite3_bind_int64(delStmt, 1, id);
+        if (sqlite3_step(delStmt) == SQLITE_DONE) {
+            ++deletedCount;
+        }
+    }
+
+    sqlite3_finalize(delStmt);
+    sqlite3_exec(m_db, "COMMIT;", nullptr, nullptr, nullptr);
+    return deletedCount;
 }
 
 int Database::trackCount() const {
@@ -331,6 +530,52 @@ void Database::setTrackRating(int64_t trackId, int rating) {
     }
 }
 
+bool Database::setAlbumType(const QString& album,
+                            const QString& albumArtist,
+                            bool isCompilation,
+                            const QString& albumType) {
+    QMutexLocker lock(&m_mutex);
+    QString sql = "UPDATE tracks SET album_type = ? WHERE LOWER(COALESCE(NULLIF(album, ''), 'Unknown Album')) = LOWER(?)";
+    if (isCompilation || albumArtist.compare("Various Artists", Qt::CaseInsensitive) == 0) {
+        sql += " AND (is_compilation = 1 OR LOWER(album_artist) = 'various artists')";
+    } else {
+        sql += " AND LOWER(COALESCE(NULLIF(album_artist, ''), NULLIF(artist, ''), 'Unknown Artist')) = LOWER(?)";
+    }
+
+    sqlite3_stmt* stmt = nullptr;
+    const QByteArray sqlUtf8 = sql.toUtf8();
+    if (sqlite3_prepare_v2(m_db, sqlUtf8.constData(), sqlUtf8.size(), &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+
+    const QByteArray typeUtf8 = albumType.trimmed().toUtf8();
+    const QByteArray albUtf8 = album.toUtf8();
+    sqlite3_bind_text(stmt, 1, typeUtf8.constData(), typeUtf8.size(), SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, albUtf8.constData(), albUtf8.size(), SQLITE_TRANSIENT);
+    if (!isCompilation && albumArtist.compare("Various Artists", Qt::CaseInsensitive) != 0) {
+        const QByteArray artUtf8 = albumArtist.toUtf8();
+        sqlite3_bind_text(stmt, 3, artUtf8.constData(), artUtf8.size(), SQLITE_TRANSIENT);
+    }
+
+    const bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+QStringList Database::distinctAlbumTypes() const {
+    QMutexLocker lock(&m_mutex);
+    QStringList out;
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, "SELECT DISTINCT album_type FROM tracks WHERE album_type != '' ORDER BY LOWER(album_type)", -1, &stmt, nullptr) == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            const QString t = colText(stmt, 0);
+            if (!t.isEmpty()) out.append(t);
+        }
+        sqlite3_finalize(stmt);
+    }
+    return out;
+}
+
 QString Database::buildSearchSql(const QString& searchText, QVariantList& bindValues) const {
     const QString trimmed = searchText.trimmed();
     if (trimmed.isEmpty()) return "1=1";
@@ -341,8 +586,8 @@ QString Database::buildSearchSql(const QString& searchText, QVariantList& bindVa
     escaped.replace('_', "\\_");
     const QString pat = "%" + escaped + "%";
 
-    for (int i = 0; i < 5; ++i) bindValues.append(pat);
-    return "(title LIKE ? ESCAPE '\\' OR artist LIKE ? ESCAPE '\\' OR album_artist LIKE ? ESCAPE '\\' OR album LIKE ? ESCAPE '\\' OR genre LIKE ? ESCAPE '\\')";
+    for (int i = 0; i < 6; ++i) bindValues.append(pat);
+    return "(title LIKE ? ESCAPE '\\' OR artist LIKE ? ESCAPE '\\' OR album_artist LIKE ? ESCAPE '\\' OR album LIKE ? ESCAPE '\\' OR album_type LIKE ? ESCAPE '\\' OR genre LIKE ? ESCAPE '\\')";
 }
 
 QVector<Album> Database::queryAlbums(const RuleGroup& rules,
@@ -363,6 +608,7 @@ QVector<Album> Database::queryAlbums(const RuleGroup& rules,
         "  MAX(year) AS yr, "
         "  MAX(genre) AS gnr, "
         "  MAX(is_compilation) AS comp, "
+        "  MAX(album_type) AS alb_type, "
         "  COUNT(*) AS cnt, "
         "  SUM(duration_ms) AS dur, "
         "  MAX(art_hash) AS art, "
@@ -385,11 +631,15 @@ QVector<Album> Database::queryAlbums(const RuleGroup& rules,
             a.year = sqlite3_column_int(stmt, 2);
             a.genre = colText(stmt, 3);
             a.isCompilation = sqlite3_column_int(stmt, 4) != 0;
-            a.trackCount = sqlite3_column_int(stmt, 5);
-            a.totalDurationMs = sqlite3_column_int64(stmt, 6);
-            a.artHash = colText(stmt, 7);
-            a.firstTrackPath = colText(stmt, 8);
-            a.discCount = qMax(1, sqlite3_column_int(stmt, 9));
+            a.albumType = colText(stmt, 5);
+            if (a.albumType.isEmpty() && a.isCompilation) {
+                a.albumType = "Compilation";
+            }
+            a.trackCount = sqlite3_column_int(stmt, 6);
+            a.totalDurationMs = sqlite3_column_int64(stmt, 7);
+            a.artHash = colText(stmt, 8);
+            a.firstTrackPath = colText(stmt, 9);
+            a.discCount = qMax(1, sqlite3_column_int(stmt, 10));
             albums.append(a);
         }
         sqlite3_finalize(stmt);
@@ -442,7 +692,7 @@ QVector<Track> Database::queryTracks(const RuleGroup& rules,
     const QString sql = QString(
         "SELECT id, path, title, artist, album_artist, album, genre, year, "
         "       track_number, disc_number, duration_ms, bitrate, sample_rate, "
-        "       format, rating, play_count, date_added, last_played, is_compilation, art_hash "
+        "       format, rating, play_count, date_added, last_played, is_compilation, album_type, art_hash "
         "FROM tracks "
         "WHERE (%1) AND (%2) AND (%3) "
         "%4"
@@ -473,7 +723,8 @@ QVector<Track> Database::queryTracks(const RuleGroup& rules,
             t.dateAdded = sqlite3_column_int64(stmt, 16);
             t.lastPlayed = sqlite3_column_int64(stmt, 17);
             t.isCompilation = sqlite3_column_int(stmt, 18) != 0;
-            t.artHash = colText(stmt, 19);
+            t.albumType = colText(stmt, 19);
+            t.artHash = colText(stmt, 20);
             tracks.append(t);
         }
         sqlite3_finalize(stmt);
@@ -530,6 +781,265 @@ bool Database::deleteCollection(const QString& id) {
     const bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
     return ok;
+}
+
+QVector<Database::Playlist> Database::loadPlaylists() const {
+    QMutexLocker lock(&m_mutex);
+    QVector<Playlist> out;
+    const char* sql = R"SQL(
+        SELECT p.id, p.name, COUNT(pt.track_path)
+        FROM playlists p
+        LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id
+        GROUP BY p.id, p.name
+        ORDER BY p.sort_index ASC, LOWER(p.name) ASC;
+    )SQL";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            Playlist pl;
+            pl.id = colText(stmt, 0);
+            pl.name = colText(stmt, 1);
+            pl.trackCount = sqlite3_column_int(stmt, 2);
+            out.append(pl);
+        }
+        sqlite3_finalize(stmt);
+    }
+    return out;
+}
+
+bool Database::createPlaylist(const QString& id, const QString& name) {
+    QMutexLocker lock(&m_mutex);
+    const char* sql = R"SQL(
+        INSERT INTO playlists (id, name, sort_index)
+        VALUES (?, ?, (SELECT COALESCE(MAX(sort_index), 0) + 1 FROM playlists));
+    )SQL";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
+    const QByteArray idUtf8 = id.toUtf8();
+    const QByteArray nameUtf8 = name.trimmed().toUtf8();
+    sqlite3_bind_text(stmt, 1, idUtf8.constData(), idUtf8.size(), SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, nameUtf8.constData(), nameUtf8.size(), SQLITE_TRANSIENT);
+    const bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+bool Database::renamePlaylist(const QString& id, const QString& newName) {
+    QMutexLocker lock(&m_mutex);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, "UPDATE playlists SET name = ? WHERE id = ?", -1, &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+    const QByteArray nameUtf8 = newName.trimmed().toUtf8();
+    const QByteArray idUtf8 = id.toUtf8();
+    sqlite3_bind_text(stmt, 1, nameUtf8.constData(), nameUtf8.size(), SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, idUtf8.constData(), idUtf8.size(), SQLITE_TRANSIENT);
+    const bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+bool Database::deletePlaylist(const QString& id) {
+    QMutexLocker lock(&m_mutex);
+    sqlite3_exec(m_db, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
+    const QByteArray idUtf8 = id.toUtf8();
+
+    sqlite3_stmt* s1 = nullptr;
+    if (sqlite3_prepare_v2(m_db, "DELETE FROM playlist_tracks WHERE playlist_id = ?", -1, &s1, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(s1, 1, idUtf8.constData(), idUtf8.size(), SQLITE_TRANSIENT);
+        sqlite3_step(s1);
+        sqlite3_finalize(s1);
+    }
+
+    bool ok = false;
+    sqlite3_stmt* s2 = nullptr;
+    if (sqlite3_prepare_v2(m_db, "DELETE FROM playlists WHERE id = ?", -1, &s2, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(s2, 1, idUtf8.constData(), idUtf8.size(), SQLITE_TRANSIENT);
+        ok = (sqlite3_step(s2) == SQLITE_DONE);
+        sqlite3_finalize(s2);
+    }
+
+    sqlite3_exec(m_db, "COMMIT;", nullptr, nullptr, nullptr);
+    return ok;
+}
+
+bool Database::addTracksToPlaylist(const QString& playlistId, const QStringList& trackPaths) {
+    if (trackPaths.isEmpty()) return true;
+    QMutexLocker lock(&m_mutex);
+    const QByteArray idUtf8 = playlistId.toUtf8();
+
+    int nextPos = 0;
+    sqlite3_stmt* posStmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, "SELECT COALESCE(MAX(position), -1) + 1 FROM playlist_tracks WHERE playlist_id = ?", -1, &posStmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(posStmt, 1, idUtf8.constData(), idUtf8.size(), SQLITE_TRANSIENT);
+        if (sqlite3_step(posStmt) == SQLITE_ROW) {
+            nextPos = sqlite3_column_int(posStmt, 0);
+        }
+        sqlite3_finalize(posStmt);
+    }
+
+    sqlite3_exec(m_db, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
+    sqlite3_stmt* insStmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, "INSERT INTO playlist_tracks (playlist_id, position, track_path) VALUES (?, ?, ?)", -1, &insStmt, nullptr) != SQLITE_OK) {
+        sqlite3_exec(m_db, "ROLLBACK;", nullptr, nullptr, nullptr);
+        return false;
+    }
+
+    for (const QString& path : trackPaths) {
+        sqlite3_reset(insStmt);
+        sqlite3_clear_bindings(insStmt);
+        const QByteArray pUtf8 = path.toUtf8();
+        sqlite3_bind_text(insStmt, 1, idUtf8.constData(), idUtf8.size(), SQLITE_TRANSIENT);
+        sqlite3_bind_int(insStmt, 2, nextPos++);
+        sqlite3_bind_text(insStmt, 3, pUtf8.constData(), pUtf8.size(), SQLITE_TRANSIENT);
+        sqlite3_step(insStmt);
+    }
+
+    sqlite3_finalize(insStmt);
+    sqlite3_exec(m_db, "COMMIT;", nullptr, nullptr, nullptr);
+    return true;
+}
+
+bool Database::removeTrackFromPlaylist(const QString& playlistId, int position) {
+    QMutexLocker lock(&m_mutex);
+    const QByteArray idUtf8 = playlistId.toUtf8();
+
+    QStringList paths;
+    sqlite3_stmt* sel = nullptr;
+    if (sqlite3_prepare_v2(m_db, "SELECT track_path FROM playlist_tracks WHERE playlist_id = ? ORDER BY position ASC", -1, &sel, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(sel, 1, idUtf8.constData(), idUtf8.size(), SQLITE_TRANSIENT);
+        while (sqlite3_step(sel) == SQLITE_ROW) {
+            paths.append(colText(sel, 0));
+        }
+        sqlite3_finalize(sel);
+    }
+
+    if (position < 0 || position >= paths.size()) return false;
+    paths.removeAt(position);
+
+    sqlite3_exec(m_db, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
+    sqlite3_stmt* del = nullptr;
+    if (sqlite3_prepare_v2(m_db, "DELETE FROM playlist_tracks WHERE playlist_id = ?", -1, &del, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(del, 1, idUtf8.constData(), idUtf8.size(), SQLITE_TRANSIENT);
+        sqlite3_step(del);
+        sqlite3_finalize(del);
+    }
+
+    sqlite3_stmt* ins = nullptr;
+    if (sqlite3_prepare_v2(m_db, "INSERT INTO playlist_tracks (playlist_id, position, track_path) VALUES (?, ?, ?)", -1, &ins, nullptr) == SQLITE_OK) {
+        for (int i = 0; i < paths.size(); ++i) {
+            sqlite3_reset(ins);
+            sqlite3_clear_bindings(ins);
+            const QByteArray pUtf8 = paths[i].toUtf8();
+            sqlite3_bind_text(ins, 1, idUtf8.constData(), idUtf8.size(), SQLITE_TRANSIENT);
+            sqlite3_bind_int(ins, 2, i);
+            sqlite3_bind_text(ins, 3, pUtf8.constData(), pUtf8.size(), SQLITE_TRANSIENT);
+            sqlite3_step(ins);
+        }
+        sqlite3_finalize(ins);
+    }
+
+    sqlite3_exec(m_db, "COMMIT;", nullptr, nullptr, nullptr);
+    return true;
+}
+
+bool Database::movePlaylistTrack(const QString& playlistId, int fromPos, int toPos) {
+    QMutexLocker lock(&m_mutex);
+    const QByteArray idUtf8 = playlistId.toUtf8();
+
+    QStringList paths;
+    sqlite3_stmt* sel = nullptr;
+    if (sqlite3_prepare_v2(m_db, "SELECT track_path FROM playlist_tracks WHERE playlist_id = ? ORDER BY position ASC", -1, &sel, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(sel, 1, idUtf8.constData(), idUtf8.size(), SQLITE_TRANSIENT);
+        while (sqlite3_step(sel) == SQLITE_ROW) {
+            paths.append(colText(sel, 0));
+        }
+        sqlite3_finalize(sel);
+    }
+
+    if (fromPos < 0 || fromPos >= paths.size() || toPos < 0 || toPos >= paths.size() || fromPos == toPos) {
+        return false;
+    }
+    paths.move(fromPos, toPos);
+
+    sqlite3_exec(m_db, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
+    sqlite3_stmt* del = nullptr;
+    if (sqlite3_prepare_v2(m_db, "DELETE FROM playlist_tracks WHERE playlist_id = ?", -1, &del, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(del, 1, idUtf8.constData(), idUtf8.size(), SQLITE_TRANSIENT);
+        sqlite3_step(del);
+        sqlite3_finalize(del);
+    }
+
+    sqlite3_stmt* ins = nullptr;
+    if (sqlite3_prepare_v2(m_db, "INSERT INTO playlist_tracks (playlist_id, position, track_path) VALUES (?, ?, ?)", -1, &ins, nullptr) == SQLITE_OK) {
+        for (int i = 0; i < paths.size(); ++i) {
+            sqlite3_reset(ins);
+            sqlite3_clear_bindings(ins);
+            const QByteArray pUtf8 = paths[i].toUtf8();
+            sqlite3_bind_text(ins, 1, idUtf8.constData(), idUtf8.size(), SQLITE_TRANSIENT);
+            sqlite3_bind_int(ins, 2, i);
+            sqlite3_bind_text(ins, 3, pUtf8.constData(), pUtf8.size(), SQLITE_TRANSIENT);
+            sqlite3_step(ins);
+        }
+        sqlite3_finalize(ins);
+    }
+
+    sqlite3_exec(m_db, "COMMIT;", nullptr, nullptr, nullptr);
+    return true;
+}
+
+QVector<Track> Database::queryPlaylistTracks(const QString& playlistId, const QString& searchText) const {
+    QMutexLocker lock(&m_mutex);
+    QVector<Track> tracks;
+    QVariantList bindValues;
+    bindValues.append(playlistId);
+    const QString searchSql = buildSearchSql(searchText, bindValues);
+
+    const QString sql = QString(
+        "SELECT t.id, pt.track_path, t.title, t.artist, t.album_artist, t.album, t.genre, t.year, "
+        "       t.track_number, t.disc_number, t.duration_ms, t.bitrate, t.sample_rate, "
+        "       t.format, t.rating, t.play_count, t.date_added, t.last_played, t.is_compilation, t.album_type, t.art_hash "
+        "FROM playlist_tracks pt "
+        "LEFT JOIN tracks t ON t.path = pt.track_path "
+        "WHERE pt.playlist_id = ? AND (%1) "
+        "ORDER BY pt.position ASC"
+    ).arg(searchText.trimmed().isEmpty() ? "1=1" : searchSql);
+
+    sqlite3_stmt* stmt = nullptr;
+    const QByteArray sqlUtf8 = sql.toUtf8();
+    if (sqlite3_prepare_v2(m_db, sqlUtf8.constData(), sqlUtf8.size(), &stmt, nullptr) == SQLITE_OK) {
+        bindVariantList(stmt, bindValues);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            Track t;
+            t.id = sqlite3_column_int64(stmt, 0);
+            t.path = colText(stmt, 1);
+            t.title = colText(stmt, 2);
+            if (t.title.isEmpty()) {
+                t.title = QFileInfo(t.path).completeBaseName();
+            }
+            t.artist = colText(stmt, 3);
+            t.albumArtist = colText(stmt, 4);
+            t.album = colText(stmt, 5);
+            t.genre = colText(stmt, 6);
+            t.year = sqlite3_column_int(stmt, 7);
+            t.trackNumber = sqlite3_column_int(stmt, 8);
+            t.discNumber = sqlite3_column_int(stmt, 9);
+            t.durationMs = sqlite3_column_int64(stmt, 10);
+            t.bitrate = sqlite3_column_int(stmt, 11);
+            t.sampleRate = sqlite3_column_int(stmt, 12);
+            t.format = colText(stmt, 13);
+            t.rating = sqlite3_column_int(stmt, 14);
+            t.playCount = sqlite3_column_int(stmt, 15);
+            t.dateAdded = sqlite3_column_int64(stmt, 16);
+            t.lastPlayed = sqlite3_column_int64(stmt, 17);
+            t.isCompilation = sqlite3_column_int(stmt, 18) != 0;
+            t.albumType = colText(stmt, 19);
+            t.artHash = colText(stmt, 20);
+            tracks.append(t);
+        }
+        sqlite3_finalize(stmt);
+    }
+    return tracks;
 }
 
 } // namespace honeycomb

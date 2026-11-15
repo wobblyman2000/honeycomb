@@ -1,17 +1,26 @@
 #include "MainWindow.h"
 #include "AppIcon.h"
 #include "RuleBuilderDialog.h"
+#include "TagEditorDialog.h"
 
+#include <QActionGroup>
 #include <QApplication>
+#include <QCheckBox>
 #include <QDir>
+#include <QFile>
 #include <QFileDialog>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QInputDialog>
 #include <QMenu>
+#include <QMessageBox>
 #include <QRandomGenerator>
+#include <QSettings>
 #include <QSplitter>
 #include <QStandardPaths>
+#include <QTextStream>
 #include <QTimer>
+#include <QUuid>
 #include <QVBoxLayout>
 #include <algorithm>
 
@@ -38,10 +47,12 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 
     const QString dataDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     const QString cacheDir = QStandardPaths::writableLocation(QStandardPaths::CacheLocation) + "/art";
+    m_artCacheDir = cacheDir;
     QDir().mkpath(dataDir);
     QDir().mkpath(cacheDir);
 
     m_db.open(dataDir + "/honeycomb.db");
+    m_autoDjConfig = AutoDjConfig::load();
     m_artCache = new ArtCache(cacheDir, this);
     m_scanner = new LibraryScanner(&m_db, cacheDir, this);
     m_audio = new AudioEngine(this);
@@ -76,6 +87,9 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
         }
         m_timeLabel->setText(QString("%1 / %2").arg(formatSec(pos), formatSec(m_currentDurationSec)));
         if (m_mpris) m_mpris->setPositionSeconds(pos);
+        if (m_theater) m_theater->setPositionSeconds(pos, m_currentDurationSec);
+        if (m_miniPlayer) m_miniPlayer->setPositionSeconds(pos, m_currentDurationSec);
+        updateSidebarLyrics(static_cast<int64_t>(pos * 1000.0));
     });
     connect(m_audio, &AudioEngine::durationChanged, this, [this](double dur) {
         m_currentDurationSec = dur;
@@ -83,6 +97,8 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(m_audio, &AudioEngine::stateChanged, this, [this](AudioEngine::State st) {
         m_playPauseBtn->setText(st == AudioEngine::State::Playing ? "⏸" : "▶");
         if (m_mpris) m_mpris->setPlaybackState(st);
+        if (m_theater) m_theater->setPlaybackState(st);
+        if (m_miniPlayer) m_miniPlayer->setPlaybackState(st);
     });
     connect(m_audio, &AudioEngine::trackFinished, this, &MainWindow::playNext);
 
@@ -118,11 +134,35 @@ void MainWindow::setupUi() {
     leftLayout->addWidget(m_sidebarList, 1);
 
     auto* newColBtn = new QPushButton("+ New Collection / Smart Playlist", leftPane);
+    auto* plBtnRow = new QHBoxLayout();
+    auto* newPlBtn = new QPushButton("+ New Playlist", leftPane);
+    auto* importM3uBtn = new QPushButton("Import M3U...", leftPane);
+    plBtnRow->addWidget(newPlBtn);
+    plBtnRow->addWidget(importM3uBtn);
     auto* addFolderBtn = new QPushButton("+ Add Music Folder", leftPane);
     auto* rescanBtn = new QPushButton("Rescan Library", leftPane);
+    auto* autoWatchChk = new QCheckBox("Auto-watch folders", leftPane);
+    {
+        QSettings s("Honeycomb", "Honeycomb");
+        const bool watchOn = s.value("library/autoWatch", true).toBool();
+        autoWatchChk->setChecked(watchOn);
+        m_scanner->setAutoWatchEnabled(watchOn);
+        m_scanner->watchFolders(m_db.libraryFolders());
+    }
+    connect(autoWatchChk, &QCheckBox::toggled, this, [this](bool on) {
+        QSettings s("Honeycomb", "Honeycomb");
+        s.setValue("library/autoWatch", on);
+        m_scanner->setAutoWatchEnabled(on);
+        if (on) m_scanner->watchFolders(m_db.libraryFolders());
+    });
+    connect(newPlBtn, &QPushButton::clicked, this, [this]() { onNewPlaylist(); });
+    connect(importM3uBtn, &QPushButton::clicked, this, &MainWindow::onImportM3U);
+
     leftLayout->addWidget(newColBtn);
+    leftLayout->addLayout(plBtnRow);
     leftLayout->addWidget(addFolderBtn);
     leftLayout->addWidget(rescanBtn);
+    leftLayout->addWidget(autoWatchChk);
 
     m_scanStatusLabel = new QLabel("0 tracks", leftPane);
     m_scanStatusLabel->setStyleSheet("color: #8c92a4; font-size: 11px;");
@@ -153,9 +193,12 @@ void MainWindow::setupUi() {
 
     m_sortCombo = new QComboBox(centerPane);
     m_sortCombo->addItem("Sort: Artist / Year", static_cast<int>(SortOrder::AlbumArtistYear));
+    m_sortCombo->addItem("Sort: Artist / Type / Year", static_cast<int>(SortOrder::AlbumArtistTypeYear));
+    m_sortCombo->addItem("Sort: Album Type / Year", static_cast<int>(SortOrder::AlbumTypeYear));
     m_sortCombo->addItem("Sort: Album", static_cast<int>(SortOrder::AlbumTitle));
     m_sortCombo->addItem("Sort: Year (Newest)", static_cast<int>(SortOrder::YearDesc));
     m_sortCombo->addItem("Sort: Recently Added", static_cast<int>(SortOrder::RecentlyAdded));
+    m_sortCombo->addItem("Sort: Recently Played", static_cast<int>(SortOrder::RecentlyPlayed));
     m_sortCombo->addItem("Sort: Track Title", static_cast<int>(SortOrder::TrackTitle));
 
     m_artZoomSlider = new QSlider(Qt::Horizontal, centerPane);
@@ -285,23 +328,44 @@ void MainWindow::setupUi() {
     rightLayout->addWidget(m_npFormatLabel);
     rightLayout->addWidget(m_npRating);
 
+    auto* rightTabs = new QTabWidget(rightPane);
+    auto* queueTab = new QWidget(rightTabs);
+    auto* queueTabLayout = new QVBoxLayout(queueTab);
+    queueTabLayout->setContentsMargins(0, 6, 0, 0);
+    queueTabLayout->setSpacing(4);
+
     auto* qHeaderRow = new QHBoxLayout();
-    auto* qHeader = new QLabel("PLAYING QUEUE", rightPane);
-    qHeader->setStyleSheet("font-size: 11px; font-weight: 700; letter-spacing: 1.5px; color: #8c92a4;");
-    m_autoDjBtn = new QPushButton("Auto-DJ", rightPane);
+    m_autoDjBtn = new QPushButton("Auto-DJ", queueTab);
     m_autoDjBtn->setCheckable(true);
-    m_autoDjBtn->setToolTip("Automatically queue tracks from the active collection when queue ends");
-    auto* clearQBtn = new QPushButton("Clear", rightPane);
+    m_autoDjBtn->setContextMenuPolicy(Qt::CustomContextMenu);
+    m_autoDjBtn->setToolTip("Toggle Auto-DJ (right-click or click ⚙ to configure rules)");
+    auto* autoDjSettingsBtn = new QPushButton("⚙", queueTab);
+    autoDjSettingsBtn->setFixedWidth(28);
+    autoDjSettingsBtn->setToolTip("Auto-DJ Settings & Rules...");
+    connect(autoDjSettingsBtn, &QPushButton::clicked, this, &MainWindow::openAutoDjSettings);
+    connect(m_autoDjBtn, &QPushButton::customContextMenuRequested, this, [this](const QPoint&) {
+        openAutoDjSettings();
+    });
+    auto* clearQBtn = new QPushButton("Clear", queueTab);
     clearQBtn->setFlat(true);
-    qHeaderRow->addWidget(qHeader);
     qHeaderRow->addStretch();
     qHeaderRow->addWidget(m_autoDjBtn);
+    qHeaderRow->addWidget(autoDjSettingsBtn);
     qHeaderRow->addWidget(clearQBtn);
-    rightLayout->addLayout(qHeaderRow);
+    queueTabLayout->addLayout(qHeaderRow);
 
-    m_queueList = new QListWidget(rightPane);
+    m_queueList = new QListWidget(queueTab);
     m_queueList->setContextMenuPolicy(Qt::CustomContextMenu);
-    rightLayout->addWidget(m_queueList, 1);
+    queueTabLayout->addWidget(m_queueList, 1);
+
+    m_sidebarLyricsList = new QListWidget(rightTabs);
+    m_sidebarLyricsList->setWordWrap(true);
+    m_sidebarLyricsList->setSelectionMode(QAbstractItemView::NoSelection);
+    m_sidebarLyricsList->setFocusPolicy(Qt::NoFocus);
+
+    rightTabs->addTab(queueTab, "Queue");
+    rightTabs->addTab(m_sidebarLyricsList, "Lyrics");
+    rightLayout->addWidget(rightTabs, 1);
 
     mainSplitter->addWidget(rightPane);
     mainSplitter->setStretchFactor(0, 0);
@@ -337,6 +401,52 @@ void MainWindow::setupUi() {
     m_volumeSlider->setFixedWidth(100);
     m_audio->setVolume(80);
 
+    auto* audioBtn = new QPushButton("Audio ▾", transportBar);
+    audioBtn->setToolTip("ReplayGain & Crossfade settings");
+    auto* audioMenu = new QMenu(audioBtn);
+
+    QSettings audioSettings("Honeycomb", "Honeycomb");
+    const auto savedRg = static_cast<AudioEngine::ReplayGainMode>(
+        audioSettings.value("audio/replayGain", static_cast<int>(AudioEngine::ReplayGainMode::Album)).toInt());
+    const int savedCf = audioSettings.value("audio/crossfadeSec", 0).toInt();
+    m_audio->setReplayGain(savedRg);
+    m_audio->setCrossfadeSeconds(savedCf);
+
+    QMenu* rgMenu = audioMenu->addMenu("ReplayGain");
+    auto* rgGroup = new QActionGroup(rgMenu);
+    auto addRgOpt = [&](const QString& label, AudioEngine::ReplayGainMode mode) {
+        QAction* act = rgMenu->addAction(label);
+        act->setCheckable(true);
+        act->setChecked(savedRg == mode);
+        rgGroup->addAction(act);
+        connect(act, &QAction::triggered, this, [this, mode]() {
+            m_audio->setReplayGain(mode);
+            QSettings("Honeycomb", "Honeycomb").setValue("audio/replayGain", static_cast<int>(mode));
+        });
+    };
+    addRgOpt("Off", AudioEngine::ReplayGainMode::Off);
+    addRgOpt("Track", AudioEngine::ReplayGainMode::Track);
+    addRgOpt("Album", AudioEngine::ReplayGainMode::Album);
+
+    QMenu* cfMenu = audioMenu->addMenu("Crossfade");
+    auto* cfGroup = new QActionGroup(cfMenu);
+    for (int sec : {0, 2, 4, 6, 8}) {
+        QAction* act = cfMenu->addAction(sec == 0 ? "Off" : QString("%1 seconds").arg(sec));
+        act->setCheckable(true);
+        act->setChecked(savedCf == sec);
+        cfGroup->addAction(act);
+        connect(act, &QAction::triggered, this, [this, sec]() {
+            m_audio->setCrossfadeSeconds(sec);
+            QSettings("Honeycomb", "Honeycomb").setValue("audio/crossfadeSec", sec);
+        });
+    }
+    audioBtn->setMenu(audioMenu);
+
+    auto* theaterBtn = new QPushButton("Theater", transportBar);
+    theaterBtn->setToolTip("Full-Screen Theater Mode with Lyrics (Esc to exit)");
+    auto* miniBtn = new QPushButton("Mini", transportBar);
+    miniBtn->setToolTip("Compact Floating Mini Player");
+
     tLayout->addWidget(m_shuffleBtn);
     tLayout->addWidget(prevBtn);
     tLayout->addWidget(m_playPauseBtn);
@@ -346,8 +456,14 @@ void MainWindow::setupUi() {
     tLayout->addWidget(m_timeLabel);
     tLayout->addWidget(new QLabel("🔊", transportBar));
     tLayout->addWidget(m_volumeSlider);
+    tLayout->addWidget(audioBtn);
+    tLayout->addWidget(theaterBtn);
+    tLayout->addWidget(miniBtn);
 
     rootLayout->addWidget(transportBar);
+
+    connect(theaterBtn, &QPushButton::clicked, this, &MainWindow::enterTheaterMode);
+    connect(miniBtn, &QPushButton::clicked, this, &MainWindow::enterMiniPlayer);
 
     // --- CONNECTIONS ---
     connect(newColBtn, &QPushButton::clicked, this, &MainWindow::onNewCollection);
@@ -361,7 +477,12 @@ void MainWindow::setupUi() {
 
     connect(m_sidebarList, &QListWidget::itemClicked, this, [this](QListWidgetItem* item) {
         const QString id = item->data(Qt::UserRole).toString();
-        if (!id.isEmpty()) activateCollection(id);
+        if (id.isEmpty()) return;
+        if (item->data(Qt::UserRole + 1).toBool()) {
+            activatePlaylist(id);
+        } else {
+            activateCollection(id);
+        }
     });
 
     connect(m_sidebarList, &QListWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
@@ -369,6 +490,46 @@ void MainWindow::setupUi() {
         if (!item) return;
         const QString id = item->data(Qt::UserRole).toString();
         if (id.isEmpty()) return;
+
+        if (item->data(Qt::UserRole + 1).toBool()) {
+            QMenu menu(this);
+            QAction* playAct = menu.addAction("Play Playlist");
+            QAction* renameAct = menu.addAction("Rename Playlist...");
+            QAction* exportAct = menu.addAction("Export M3U8...");
+            menu.addSeparator();
+            QAction* delAct = menu.addAction("Delete Playlist");
+            QAction* chosen = menu.exec(m_sidebarList->viewport()->mapToGlobal(pos));
+            if (!chosen) return;
+            if (chosen == playAct) {
+                const auto tracks = m_db.queryPlaylistTracks(id);
+                if (!tracks.isEmpty()) playQueue(tracks, 0);
+            } else if (chosen == renameAct) {
+                QString curName;
+                for (const auto& pl : m_playlists) {
+                    if (pl.id == id) { curName = pl.name; break; }
+                }
+                bool ok = false;
+                const QString newName = QInputDialog::getText(
+                    this, "Rename Playlist", "Playlist name:", QLineEdit::Normal, curName, &ok);
+                if (ok && !newName.trimmed().isEmpty()) {
+                    m_db.renamePlaylist(id, newName.trimmed());
+                    loadCollectionsSidebar();
+                    if (m_activePlaylistId == id) activatePlaylist(id);
+                }
+            } else if (chosen == exportAct) {
+                onExportM3U(id);
+            } else if (chosen == delAct) {
+                m_db.deletePlaylist(id);
+                if (m_activePlaylistId == id) {
+                    m_activePlaylistId.clear();
+                    loadCollectionsSidebar();
+                    if (!m_collections.isEmpty()) activateCollection(m_collections.first().id);
+                } else {
+                    loadCollectionsSidebar();
+                }
+            }
+            return;
+        }
 
         for (const auto& c : m_collections) {
             if (c.id == id && !c.isSystem) {
@@ -454,6 +615,43 @@ void MainWindow::setupUi() {
         }
     });
     connect(m_albumGrid, &AlbumGridView::findArtistRequested, this, &MainWindow::findArtist);
+    connect(m_albumGrid, &AlbumGridView::albumTypeChangeRequested, this, [this](const Album& alb, const QString& albumType) {
+        if (m_db.setAlbumType(alb.album, alb.albumArtist, alb.isCompilation, albumType)) {
+            refreshCurrentView(true);
+        }
+    });
+    connect(m_albumGrid, &AlbumGridView::editAlbumTagsRequested, this, [this](const Album& alb) {
+        for (const auto& c : m_collections) {
+            if (c.id == m_activeCollectionId) {
+                const auto tracks = m_db.queryTracks(effectiveRules(c), m_searchEdit->text(), SortOrder::AlbumArtistYear, alb.album, alb.albumArtist);
+                openTagEditor(tracks);
+                break;
+            }
+        }
+    });
+    connect(m_albumGrid, &AlbumGridView::albumAddToPlaylistRequested, this, [this](const Album& alb, const QString& plId) {
+        for (const auto& c : m_collections) {
+            if (c.id == m_activeCollectionId) {
+                const auto tracks = m_db.queryTracks(effectiveRules(c), m_searchEdit->text(), SortOrder::AlbumArtistYear, alb.album, alb.albumArtist);
+                QStringList paths;
+                for (const Track& t : tracks) paths.append(t.path);
+                m_db.addTracksToPlaylist(plId, paths);
+                loadCollectionsSidebar();
+                break;
+            }
+        }
+    });
+    connect(m_albumGrid, &AlbumGridView::albumAddToNewPlaylistRequested, this, [this](const Album& alb) {
+        for (const auto& c : m_collections) {
+            if (c.id == m_activeCollectionId) {
+                const auto tracks = m_db.queryTracks(effectiveRules(c), m_searchEdit->text(), SortOrder::AlbumArtistYear, alb.album, alb.albumArtist);
+                QStringList paths;
+                for (const Track& t : tracks) paths.append(t.path);
+                onNewPlaylist(paths);
+                break;
+            }
+        }
+    });
 
     // Drawer controls
     connect(dCloseBtn, &QPushButton::clicked, this, &MainWindow::closeAlbumDrawer);
@@ -510,6 +708,24 @@ void MainWindow::setupUi() {
     connect(m_trackTable, &TrackTableView::trackQueueRequested, this, &MainWindow::enqueueTrack);
     connect(m_trackTable, &TrackTableView::findArtistRequested, this, &MainWindow::findArtist);
     connect(m_trackTable, &TrackTableView::findTrackRequested, this, &MainWindow::findTrack);
+    connect(m_trackTable, &TrackTableView::editTagsRequested, this, &MainWindow::openTagEditor);
+    connect(m_trackTable, &TrackTableView::addToPlaylistRequested, this, [this](const QString& plId, const QStringList& paths) {
+        m_db.addTracksToPlaylist(plId, paths);
+        loadCollectionsSidebar();
+        if (m_activePlaylistId == plId) refreshCurrentView(false);
+    });
+    connect(m_trackTable, &TrackTableView::addToNewPlaylistRequested, this, [this](const QStringList& paths) {
+        onNewPlaylist(paths);
+    });
+    connect(m_trackTable, &TrackTableView::removeFromPlaylistRequested, this, [this](const QString& plId, int row) {
+        m_db.removeTrackFromPlaylist(plId, row);
+        loadCollectionsSidebar();
+        if (m_activePlaylistId == plId) refreshCurrentView(false);
+    });
+    connect(m_trackTable, &TrackTableView::movePlaylistTrackRequested, this, [this](const QString& plId, int fromRow, int toRow) {
+        m_db.movePlaylistTrack(plId, fromRow, toRow);
+        if (m_activePlaylistId == plId) refreshCurrentView(false);
+    });
     connect(m_trackTable, &TrackTableView::trackRatingChanged, this, [this](int64_t trackId, int rating) {
         m_db.setTrackRating(trackId, rating);
         if (m_queueIndex >= 0 && m_queueIndex < m_queue.size() && m_queue[m_queueIndex].id == trackId) {
@@ -526,7 +742,12 @@ void MainWindow::setupUi() {
         }
     });
 
-    connect(m_autoDjBtn, &QPushButton::toggled, this, [this](bool on) { m_autoDj = on; });
+    connect(m_autoDjBtn, &QPushButton::toggled, this, [this](bool on) {
+        m_autoDj = on;
+        if (on) {
+            fillAutoDjQueue(true);
+        }
+    });
 
     connect(m_queueList, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem* item) {
         playTrackAtIndex(m_queueList->row(item));
@@ -595,7 +816,15 @@ void MainWindow::setupUi() {
 
 void MainWindow::loadCollectionsSidebar() {
     m_collections = m_db.loadCollections();
+    m_playlists = m_db.loadPlaylists();
     m_sidebarList->clear();
+
+    QVector<QPair<QString, QString>> plPairs;
+    for (const auto& pl : m_playlists) {
+        plPairs.append({pl.id, pl.name});
+    }
+    if (m_albumGrid) m_albumGrid->setAvailablePlaylists(plPairs);
+    if (m_trackTable) m_trackTable->setAvailablePlaylists(plPairs);
 
     auto addHeader = [&](const QString& text) {
         auto* h = new QListWidgetItem(text);
@@ -613,6 +842,7 @@ void MainWindow::loadCollectionsSidebar() {
         if (c.isSystem) {
             auto* item = new QListWidgetItem("  " + c.name);
             item->setData(Qt::UserRole, c.id);
+            item->setData(Qt::UserRole + 1, false);
             m_sidebarList->addItem(item);
         }
     }
@@ -622,6 +852,7 @@ void MainWindow::loadCollectionsSidebar() {
         if (!c.isSystem && !c.isSmartPlaylist) {
             auto* item = new QListWidgetItem("  ◆ " + c.name);
             item->setData(Qt::UserRole, c.id);
+            item->setData(Qt::UserRole + 1, false);
             m_sidebarList->addItem(item);
         }
     }
@@ -631,18 +862,29 @@ void MainWindow::loadCollectionsSidebar() {
         if (!c.isSystem && c.isSmartPlaylist) {
             auto* item = new QListWidgetItem("  ♫ " + c.name);
             item->setData(Qt::UserRole, c.id);
+            item->setData(Qt::UserRole + 1, false);
             m_sidebarList->addItem(item);
         }
+    }
+
+    addHeader("PLAYLISTS");
+    for (const auto& pl : m_playlists) {
+        auto* item = new QListWidgetItem(QString("  ♪ %1 (%2)").arg(pl.name).arg(pl.trackCount));
+        item->setData(Qt::UserRole, pl.id);
+        item->setData(Qt::UserRole + 1, true);
+        m_sidebarList->addItem(item);
     }
 }
 
 void MainWindow::activateCollection(const QString& id) {
+    m_activePlaylistId.clear();
+    if (m_trackTable) m_trackTable->setActiveStaticPlaylistId(QString());
     m_activeCollectionId = id;
     closeAlbumDrawer();
 
     for (int i = 0; i < m_sidebarList->count(); ++i) {
         auto* item = m_sidebarList->item(i);
-        if (item->data(Qt::UserRole).toString() == id) {
+        if (!item->data(Qt::UserRole + 1).toBool() && item->data(Qt::UserRole).toString() == id) {
             m_sidebarList->setCurrentItem(item);
             break;
         }
@@ -719,7 +961,33 @@ RuleGroup MainWindow::effectiveRules(const Collection& active) const {
     return combined;
 }
 
+void MainWindow::activatePlaylist(const QString& id) {
+    m_activePlaylistId = id;
+    if (m_trackTable) m_trackTable->setActiveStaticPlaylistId(id);
+    closeAlbumDrawer();
+    m_colBrowser->setVisible(false);
+    m_artZoomSlider->setVisible(false);
+
+    for (int i = 0; i < m_sidebarList->count(); ++i) {
+        auto* item = m_sidebarList->item(i);
+        if (item->data(Qt::UserRole + 1).toBool() && item->data(Qt::UserRole).toString() == id) {
+            m_sidebarList->setCurrentItem(item);
+            break;
+        }
+    }
+
+    refreshCurrentView(false);
+}
+
 void MainWindow::refreshCurrentView(bool resetColumnBrowser) {
+    if (!m_activePlaylistId.isEmpty()) {
+        m_artZoomSlider->setVisible(false);
+        closeAlbumDrawer();
+        m_viewStack->setCurrentWidget(m_trackTable);
+        m_trackTable->setTracks(m_db.queryPlaylistTracks(m_activePlaylistId, m_searchEdit->text()));
+        return;
+    }
+
     Collection active;
     bool found = false;
     for (const auto& c : m_collections) {
@@ -747,6 +1015,7 @@ void MainWindow::refreshCurrentView(bool resetColumnBrowser) {
 
     if (mode == ViewMode::AlbumCovers) {
         m_viewStack->setCurrentWidget(m_albumGrid);
+        m_albumGrid->setAvailableAlbumTypes(m_db.distinctAlbumTypes());
         m_albumGrid->setAlbums(m_db.queryAlbums(rules, search, sort));
     } else if (mode == ViewMode::AlbumAndTracks) {
         m_viewStack->setCurrentWidget(m_albumTracks);
@@ -883,6 +1152,33 @@ void MainWindow::findTrack(const QString& title) {
     refreshCurrentView(true);
 }
 
+void MainWindow::openTagEditor(const QVector<Track>& tracks) {
+    if (tracks.isEmpty()) return;
+    TagEditorDialog dlg(tracks, &m_db, m_artCache, m_artCacheDir, this);
+    if (dlg.exec() == QDialog::Accepted && dlg.hasChanges()) {
+        const auto& updated = dlg.updatedTracks();
+        QHash<int64_t, Track> byId;
+        for (const Track& t : updated) {
+            byId.insert(t.id, t);
+        }
+        for (Track& q : m_queue) {
+            auto it = byId.find(q.id);
+            if (it != byId.end()) {
+                q = it.value();
+            }
+        }
+        if (m_queueIndex >= 0 && m_queueIndex < m_queue.size() && byId.contains(m_queue[m_queueIndex].id)) {
+            const Track& cur = m_queue[m_queueIndex];
+            updateNowPlayingPanel(cur);
+            if (m_mpris) m_mpris->setCurrentTrack(cur);
+            if (m_trayIcon) m_trayIcon->setToolTip(QString("Honeycomb — %1 - %2").arg(cur.title, cur.artist));
+            if (m_trayNowPlayingAct) m_trayNowPlayingAct->setText(QString("▶ %1 — %2").arg(cur.title, cur.artist));
+        }
+        refreshQueueWidget();
+        refreshCurrentView(true);
+    }
+}
+
 void MainWindow::setupTrayAndMpris(const QString& artCacheDir) {
     m_mpris = new MprisService(artCacheDir, this);
     connect(m_mpris, &MprisService::playRequested, this, [this]() { m_audio->setPaused(false); });
@@ -919,6 +1215,8 @@ void MainWindow::setupTrayAndMpris(const QString& artCacheDir) {
         trayMenu->addAction("Next", this, &MainWindow::playNext);
         trayMenu->addAction("Previous", this, &MainWindow::playPrev);
         trayMenu->addSeparator();
+        trayMenu->addAction("Theater Mode", this, &MainWindow::enterTheaterMode);
+        trayMenu->addAction("Mini Player", this, &MainWindow::enterMiniPlayer);
         trayMenu->addAction("Show / Hide", this, [this]() {
             if (isVisible()) hide();
             else { showNormal(); raise(); activateWindow(); }
@@ -942,14 +1240,95 @@ void MainWindow::playTrackAtIndex(int index) {
     m_audio->playFile(t.path);
     m_db.incrementPlayCount(t.path);
     updateNowPlayingPanel(t);
+    if (m_autoDj) {
+        fillAutoDjQueue(false);
+    }
     refreshQueueWidget();
     if (m_mpris) m_mpris->setCurrentTrack(t);
     if (m_trayIcon) m_trayIcon->setToolTip(QString("Honeycomb — %1 - %2").arg(t.title, t.artist));
     if (m_trayNowPlayingAct) m_trayNowPlayingAct->setText(QString("▶ %1 — %2").arg(t.title, t.artist));
 }
 
+void MainWindow::fillAutoDjQueue(bool autoStartIfEmpty) {
+    if (!m_autoDj) return;
+
+    const int targetUpcoming = qMax(1, m_autoDjConfig.queueDepth);
+    const int upcoming = (m_queueIndex < 0)
+                             ? m_queue.size()
+                             : qMax(0, m_queue.size() - 1 - m_queueIndex);
+    if (upcoming >= targetUpcoming) return;
+
+    Collection active;
+    for (const auto& c : m_collections) {
+        if (c.id == m_activeCollectionId) {
+            active = c;
+            break;
+        }
+    }
+
+    const auto picked = pickAutoDjTracks(
+        m_autoDjConfig,
+        m_db,
+        m_collections,
+        m_activeCollectionId,
+        m_searchEdit->text(),
+        effectiveRules(active),
+        m_queue,
+        m_queueIndex,
+        targetUpcoming - upcoming);
+
+    if (picked.isEmpty()) return;
+    for (const Track& t : picked) {
+        m_queue.append(t);
+    }
+
+    refreshQueueWidget();
+
+    if (autoStartIfEmpty && m_queueIndex < 0 && !m_queue.isEmpty()) {
+        playTrackAtIndex(0);
+    }
+}
+
+void MainWindow::openAutoDjSettings() {
+    Collection active;
+    for (const auto& c : m_collections) {
+        if (c.id == m_activeCollectionId) {
+            active = c;
+            break;
+        }
+    }
+
+    AutoDjDialog dlg(m_autoDjConfig, &m_db, m_collections, m_activeCollectionId,
+                     m_searchEdit->text(), effectiveRules(active), m_queue, m_queueIndex, this);
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    m_autoDjConfig = dlg.resultConfig();
+    m_autoDjConfig.save();
+
+    if (dlg.startRequested() || m_autoDj) {
+        // Refresh upcoming queue tracks using the updated rules
+        if (m_queueIndex >= 0 && m_queueIndex < m_queue.size()) {
+            m_queue.resize(m_queueIndex + 1);
+        } else {
+            m_queue.clear();
+            m_queueIndex = -1;
+        }
+        if (!m_autoDj) {
+            m_autoDjBtn->setChecked(true); // triggers fillAutoDjQueue(true)
+        } else {
+            fillAutoDjQueue(true);
+            refreshQueueWidget();
+        }
+    }
+}
+
 void MainWindow::playNext() {
-    if (m_queue.isEmpty()) return;
+    if (m_queue.isEmpty()) {
+        if (m_autoDj) {
+            fillAutoDjQueue(true);
+        }
+        return;
+    }
     if (m_shuffle && m_queue.size() > 1) {
         const int next = QRandomGenerator::global()->bounded(m_queue.size());
         playTrackAtIndex(next);
@@ -958,22 +1337,9 @@ void MainWindow::playNext() {
     if (m_queueIndex + 1 < m_queue.size()) {
         playTrackAtIndex(m_queueIndex + 1);
     } else if (m_autoDj) {
-        Collection active;
-        for (const auto& c : m_collections) {
-            if (c.id == m_activeCollectionId) {
-                active = c;
-                break;
-            }
-        }
-        const auto pool = m_db.queryTracks(effectiveRules(active), m_searchEdit->text(), SortOrder::TrackTitle);
-        if (!pool.isEmpty()) {
-            const int startNext = m_queue.size();
-            const int count = qMin(5, pool.size());
-            for (int i = 0; i < count; ++i) {
-                m_queue.append(pool[QRandomGenerator::global()->bounded(pool.size())]);
-            }
-            playTrackAtIndex(startNext);
-            return;
+        fillAutoDjQueue(false);
+        if (m_queueIndex + 1 < m_queue.size()) {
+            playTrackAtIndex(m_queueIndex + 1);
         }
     } else if (m_repeat) {
         playTrackAtIndex(0);
@@ -998,6 +1364,104 @@ void MainWindow::updateNowPlayingPanel(const Track& t) {
     m_npAlbumLabel->setText(t.year > 0 ? QString("%1 (%2)").arg(t.album).arg(t.year) : t.album);
     m_npFormatLabel->setText(QString("%1  •  %2 kbps").arg(t.format).arg(t.bitrate));
     m_npRating->setRating(t.rating);
+
+    m_currentLyrics = loadLyricsForTrack(t.path);
+    m_sidebarActiveLyric = -1;
+    m_sidebarLyricsList->clear();
+    if (m_currentLyrics.lines.isEmpty()) {
+        auto* item = new QListWidgetItem("No lyrics found.\n\nPlace a .lrc file next to the track or embed a LYRICS tag.");
+        item->setForeground(QColor("#8c92a4"));
+        item->setTextAlignment(Qt::AlignCenter);
+        m_sidebarLyricsList->addItem(item);
+    } else {
+        for (const auto& l : m_currentLyrics.lines) {
+            auto* item = new QListWidgetItem(l.text.isEmpty() ? " " : l.text);
+            item->setForeground(m_currentLyrics.isSynced ? QColor("#8c92a4") : QColor("#e8eaf0"));
+            m_sidebarLyricsList->addItem(item);
+        }
+    }
+
+    if (m_theater) m_theater->setTrack(t, m_currentLyrics);
+    if (m_miniPlayer) m_miniPlayer->setTrack(t);
+}
+
+void MainWindow::updateSidebarLyrics(int64_t posMs) {
+    if (!m_currentLyrics.isSynced || m_currentLyrics.lines.isEmpty()) return;
+
+    int active = -1;
+    for (int i = 0; i < m_currentLyrics.lines.size(); ++i) {
+        if (m_currentLyrics.lines[i].timeMs <= posMs) active = i;
+        else break;
+    }
+    if (active == m_sidebarActiveLyric) return;
+
+    if (m_sidebarActiveLyric >= 0 && m_sidebarActiveLyric < m_sidebarLyricsList->count()) {
+        auto* prev = m_sidebarLyricsList->item(m_sidebarActiveLyric);
+        prev->setForeground(QColor("#8c92a4"));
+        QFont f = prev->font();
+        f.setBold(false);
+        prev->setFont(f);
+    }
+    m_sidebarActiveLyric = active;
+    if (m_sidebarActiveLyric >= 0 && m_sidebarActiveLyric < m_sidebarLyricsList->count()) {
+        auto* cur = m_sidebarLyricsList->item(m_sidebarActiveLyric);
+        cur->setForeground(QColor("#f5a623"));
+        QFont f = cur->font();
+        f.setBold(true);
+        cur->setFont(f);
+        m_sidebarLyricsList->scrollToItem(cur, QAbstractItemView::PositionAtCenter);
+    }
+}
+
+void MainWindow::enterTheaterMode() {
+    if (!m_theater) {
+        m_theater = new TheaterWindow(m_artCache, nullptr);
+        m_theater->setWindowIcon(createHoneycombIcon());
+        connect(m_theater, &TheaterWindow::playPauseRequested, m_audio, &AudioEngine::togglePause);
+        connect(m_theater, &TheaterWindow::nextRequested, this, &MainWindow::playNext);
+        connect(m_theater, &TheaterWindow::prevRequested, this, &MainWindow::playPrev);
+        connect(m_theater, &TheaterWindow::seekRequested, m_audio, &AudioEngine::seekSeconds);
+        connect(m_theater, &TheaterWindow::exitRequested, this, &MainWindow::exitTheaterMode);
+    }
+    if (m_queueIndex >= 0 && m_queueIndex < m_queue.size()) {
+        m_theater->setTrack(m_queue[m_queueIndex], m_currentLyrics);
+    }
+    m_theater->setPlaybackState(m_audio->state());
+    m_theater->showFullScreen();
+    m_theater->raise();
+    m_theater->activateWindow();
+}
+
+void MainWindow::exitTheaterMode() {
+    if (m_theater) m_theater->hide();
+    showNormal();
+    raise();
+    activateWindow();
+}
+
+void MainWindow::enterMiniPlayer() {
+    if (!m_miniPlayer) {
+        m_miniPlayer = new MiniPlayerWindow(m_artCache, nullptr);
+        m_miniPlayer->setWindowIcon(createHoneycombIcon());
+        connect(m_miniPlayer, &MiniPlayerWindow::playPauseRequested, m_audio, &AudioEngine::togglePause);
+        connect(m_miniPlayer, &MiniPlayerWindow::nextRequested, this, &MainWindow::playNext);
+        connect(m_miniPlayer, &MiniPlayerWindow::prevRequested, this, &MainWindow::playPrev);
+        connect(m_miniPlayer, &MiniPlayerWindow::expandRequested, this, &MainWindow::exitMiniPlayer);
+    }
+    if (m_queueIndex >= 0 && m_queueIndex < m_queue.size()) {
+        m_miniPlayer->setTrack(m_queue[m_queueIndex]);
+    }
+    m_miniPlayer->setPlaybackState(m_audio->state());
+    hide();
+    m_miniPlayer->show();
+    m_miniPlayer->raise();
+}
+
+void MainWindow::exitMiniPlayer() {
+    if (m_miniPlayer) m_miniPlayer->hide();
+    showNormal();
+    raise();
+    activateWindow();
 }
 
 void MainWindow::refreshQueueWidget() {
@@ -1045,6 +1509,88 @@ void MainWindow::onNewCollection() {
         m_db.saveCollection(created);
         loadCollectionsSidebar();
         activateCollection(created.id);
+    }
+}
+
+void MainWindow::onNewPlaylist(const QStringList& initialPaths) {
+    bool ok = false;
+    const QString name = QInputDialog::getText(
+        this, "New Playlist", "Playlist name:", QLineEdit::Normal, QString(), &ok);
+    if (!ok || name.trimmed().isEmpty()) return;
+
+    const QString id = "pl_" + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    if (m_db.createPlaylist(id, name.trimmed())) {
+        if (!initialPaths.isEmpty()) {
+            m_db.addTracksToPlaylist(id, initialPaths);
+        }
+        loadCollectionsSidebar();
+        activatePlaylist(id);
+    }
+}
+
+void MainWindow::onImportM3U() {
+    const QString file = QFileDialog::getOpenFileName(
+        this, "Import M3U / M3U8 Playlist", QString(), "Playlists (*.m3u *.m3u8)");
+    if (file.isEmpty()) return;
+
+    QFile f(file);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QMessageBox::warning(this, "Import Playlist", "Could not open playlist file.");
+        return;
+    }
+
+    const QDir baseDir = QFileInfo(file).dir();
+    QStringList paths;
+    QTextStream in(&f);
+    while (!in.atEnd()) {
+        const QString line = in.readLine().trimmed();
+        if (line.isEmpty() || line.startsWith('#')) continue;
+        QFileInfo fi(line);
+        if (fi.isRelative()) {
+            fi = QFileInfo(baseDir.filePath(line));
+        }
+        if (fi.exists()) {
+            paths.append(fi.absoluteFilePath());
+        }
+    }
+
+    const QString defaultName = QFileInfo(file).completeBaseName();
+    bool ok = false;
+    const QString name = QInputDialog::getText(
+        this, "Import Playlist", "Playlist name:", QLineEdit::Normal, defaultName, &ok);
+    if (!ok || name.trimmed().isEmpty()) return;
+
+    const QString id = "pl_" + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    if (m_db.createPlaylist(id, name.trimmed())) {
+        m_db.addTracksToPlaylist(id, paths);
+        loadCollectionsSidebar();
+        activatePlaylist(id);
+    }
+}
+
+void MainWindow::onExportM3U(const QString& playlistId) {
+    QString plName = "playlist";
+    for (const auto& pl : m_playlists) {
+        if (pl.id == playlistId) { plName = pl.name; break; }
+    }
+
+    const QString dest = QFileDialog::getSaveFileName(
+        this, "Export M3U8 Playlist", plName + ".m3u8", "M3U8 Playlist (*.m3u8);;M3U Playlist (*.m3u)");
+    if (dest.isEmpty()) return;
+
+    QFile f(dest);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        QMessageBox::warning(this, "Export Playlist", "Could not write playlist file.");
+        return;
+    }
+
+    const auto tracks = m_db.queryPlaylistTracks(playlistId);
+    QTextStream out(&f);
+    out << "#EXTM3U\n";
+    for (const Track& t : tracks) {
+        const int secs = static_cast<int>(t.durationMs / 1000);
+        out << "#EXTINF:" << secs << "," << t.artist << " - " << t.title << "\n";
+        out << t.path << "\n";
     }
 }
 

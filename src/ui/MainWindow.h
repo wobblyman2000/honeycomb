@@ -8,8 +8,12 @@
 #include "ui/AlbumGridView.h"
 #include "ui/AlbumTracksView.h"
 #include "ui/ArtCache.h"
+#include "ui/AutoDjDialog.h"
 #include "ui/ColumnBrowser.h"
+#include "ui/LyricsReader.h"
+#include "ui/MiniPlayerWindow.h"
 #include "ui/StarRatingWidget.h"
+#include "ui/TheaterWindow.h"
 #include "ui/TrackTableView.h"
 
 #include <QComboBox>
@@ -21,6 +25,7 @@
 #include <QSlider>
 #include <QStackedWidget>
 #include <QSystemTrayIcon>
+#include <QTabWidget>
 #include <QTableWidget>
 #include <QVector>
 
@@ -37,6 +42,7 @@ private:
     void setupTrayAndMpris(const QString& artCacheDir);
     void loadCollectionsSidebar();
     void activateCollection(const QString& id);
+    void activatePlaylist(const QString& id);
     void refreshCurrentView(bool resetColumnBrowser = true);
     void saveCurrentCollectionViewState();
     RuleGroup effectiveRules(const Collection& active) const;
@@ -44,33 +50,50 @@ private:
     void openAlbumDrawer(const Album& album);
     void closeAlbumDrawer();
 
+    void enterTheaterMode();
+    void exitTheaterMode();
+    void enterMiniPlayer();
+    void exitMiniPlayer();
+    void updateSidebarLyrics(int64_t posMs);
+
     void playQueue(const QVector<Track>& tracks, int startIndex);
     void playNextTrack(const Track& track);
     void playNextTracks(const QVector<Track>& tracks);
     void enqueueTrack(const Track& track);
     void findArtist(const QString& artist);
     void findTrack(const QString& title);
+    void openTagEditor(const QVector<Track>& tracks);
     void playTrackAtIndex(int index);
     void playNext();
     void playPrev();
+    void fillAutoDjQueue(bool autoStartIfEmpty = false);
+    void openAutoDjSettings();
     void updateNowPlayingPanel(const Track& t);
     void refreshQueueWidget();
 
     void onAddMusicFolder();
     void onNewCollection();
+    void onNewPlaylist(const QStringList& initialPaths = QStringList());
+    void onImportM3U();
+    void onExportM3U(const QString& playlistId);
     void onEditCurrentCollection();
     void onDeleteCurrentCollection();
 
     Database m_db;
+    QString m_artCacheDir;
     ArtCache* m_artCache = nullptr;
     LibraryScanner* m_scanner = nullptr;
     AudioEngine* m_audio = nullptr;
     MprisService* m_mpris = nullptr;
     QSystemTrayIcon* m_trayIcon = nullptr;
     QAction* m_trayNowPlayingAct = nullptr;
+    TheaterWindow* m_theater = nullptr;
+    MiniPlayerWindow* m_miniPlayer = nullptr;
 
     QVector<Collection> m_collections;
     QString m_activeCollectionId;
+    QVector<Database::Playlist> m_playlists;
+    QString m_activePlaylistId;
 
     // Left Sidebar
     QListWidget* m_sidebarList = nullptr;
@@ -100,7 +123,7 @@ private:
     QVector<Track> m_drawerTracks;
     QVector<int> m_drawerRowToTrack;
 
-    // Right Sidebar (Now Playing + Queue)
+    // Right Sidebar (Now Playing + Queue / Lyrics)
     QLabel* m_npArtLabel = nullptr;
     QLabel* m_npTitleLabel = nullptr;
     QLabel* m_npArtistLabel = nullptr;
@@ -109,6 +132,9 @@ private:
     StarRatingWidget* m_npRating = nullptr;
     QPushButton* m_autoDjBtn = nullptr;
     QListWidget* m_queueList = nullptr;
+    QListWidget* m_sidebarLyricsList = nullptr;
+    LyricsData m_currentLyrics;
+    int m_sidebarActiveLyric = -1;
 
     // Bottom Transport Bar
     QPushButton* m_playPauseBtn = nullptr;
@@ -126,6 +152,7 @@ private:
     bool m_shuffle = false;
     bool m_repeat = false;
     bool m_autoDj = false;
+    AutoDjConfig m_autoDjConfig;
 };
 
 } // namespace honeycomb

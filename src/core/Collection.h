@@ -17,7 +17,10 @@ enum class SortOrder {
     AlbumTitle,
     YearDesc,
     RecentlyAdded,
-    TrackTitle
+    TrackTitle,
+    AlbumArtistTypeYear,
+    AlbumTypeYear,
+    RecentlyPlayed
 };
 
 enum class LimitOrder {

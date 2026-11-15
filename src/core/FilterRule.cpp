@@ -20,6 +20,7 @@ QString columnForField(FilterField f) {
     case FilterField::Artist: return "artist";
     case FilterField::AlbumArtist: return "album_artist";
     case FilterField::Album: return "album";
+    case FilterField::AlbumType: return "album_type";
     case FilterField::Genre: return "genre";
     case FilterField::Year: return "year";
     case FilterField::Format: return "format";
@@ -62,7 +63,7 @@ QString compileCondition(const RuleCondition& c, QVariantList& bindValues) {
     }
 
     if (c.field == FilterField::AnyField) {
-        const QStringList cols = {"title", "artist", "album_artist", "album", "genre", "path"};
+        const QStringList cols = {"title", "artist", "album_artist", "album", "album_type", "genre", "path"};
         QStringList parts;
         const QString pattern = QString("%%1%").arg(escapeLike(c.value));
         for (const auto& col : cols) {
@@ -192,6 +193,7 @@ QString filterFieldToString(FilterField f) {
     case FilterField::Artist: return "artist";
     case FilterField::AlbumArtist: return "album_artist";
     case FilterField::Album: return "album";
+    case FilterField::AlbumType: return "album_type";
     case FilterField::Genre: return "genre";
     case FilterField::Year: return "year";
     case FilterField::Format: return "format";
@@ -211,6 +213,7 @@ FilterField filterFieldFromString(const QString& s) {
     if (s == "artist") return FilterField::Artist;
     if (s == "album_artist") return FilterField::AlbumArtist;
     if (s == "album") return FilterField::Album;
+    if (s == "album_type") return FilterField::AlbumType;
     if (s == "genre") return FilterField::Genre;
     if (s == "year") return FilterField::Year;
     if (s == "format") return FilterField::Format;
@@ -230,6 +233,7 @@ QString filterFieldDisplayName(FilterField f) {
     case FilterField::Artist: return "Artist";
     case FilterField::AlbumArtist: return "Album Artist";
     case FilterField::Album: return "Album";
+    case FilterField::AlbumType: return "Album Type";
     case FilterField::Genre: return "Genre";
     case FilterField::Year: return "Year";
     case FilterField::Format: return "Format";
@@ -304,6 +308,7 @@ QVector<FilterField> allFilterFields() {
         FilterField::AlbumArtist,
         FilterField::Artist,
         FilterField::Album,
+        FilterField::AlbumType,
         FilterField::Title,
         FilterField::IsCompilation,
         FilterField::Year,
