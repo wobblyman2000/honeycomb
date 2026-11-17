@@ -9,7 +9,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Widgets Concurrent DBus)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Concurrent DBus Network)
 find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(TAGLIB REQUIRED IMPORTED_TARGET taglib)
@@ -22,11 +22,22 @@ add_executable(honeycomb
     src/db/Database.cpp
     src/scanner/LibraryScanner.cpp
     src/audio/AudioEngine.cpp
+    src/cast/CastDevice.h
+    src/cast/CastDiscovery.h
+    src/cast/CastDiscovery.cpp
+    src/cast/CastMediaServer.h
+    src/cast/CastMediaServer.cpp
+    src/cast/CastController.h
+    src/cast/CastController.cpp
+    src/services/ScrobbleService.h
+    src/services/ScrobbleService.cpp
     src/linux/MprisService.h
     src/linux/MprisService.cpp
     src/ui/ArtCache.cpp
     src/ui/ColumnBrowser.cpp
     src/ui/StarRatingWidget.h
+    src/ui/WaveformWidget.h
+    src/ui/WaveformWidget.cpp
     src/ui/LyricsReader.h
     src/ui/TheaterWindow.h
     src/ui/TheaterWindow.cpp
@@ -40,6 +51,10 @@ add_executable(honeycomb
     src/ui/AutoDjDialog.cpp
     src/ui/TagEditorDialog.h
     src/ui/TagEditorDialog.cpp
+    src/ui/AutoTagDialog.h
+    src/ui/AutoTagDialog.cpp
+    src/ui/RadioPodcastPages.h
+    src/ui/RadioPodcastPages.cpp
     src/ui/MainWindow.cpp
 )
 
@@ -49,6 +64,7 @@ target_link_libraries(honeycomb PRIVATE
     Qt6::Widgets
     Qt6::Concurrent
     Qt6::DBus
+    Qt6::Network
     PkgConfig::TAGLIB
     PkgConfig::SQLITE3
     PkgConfig::MPV

@@ -48,8 +48,9 @@ MiniPlayerWindow::MiniPlayerWindow(ArtCache* artCache, QWidget* parent)
     auto* prevBtn = new QPushButton("⏮", this);
     prevBtn->setFixedSize(28, 28);
     m_playPauseBtn = new QPushButton("▶", this);
+    m_playPauseBtn->setFlat(true);
     m_playPauseBtn->setFixedSize(32, 32);
-    m_playPauseBtn->setStyleSheet("background: #f5a623; color: #111; font-weight: bold; border-radius: 16px;");
+    m_playPauseBtn->setStyleSheet("QPushButton { background: transparent; border: none; color: #f5a623; font-size: 18px; font-weight: bold; } QPushButton:hover { color: #ffd27d; }");
     auto* nextBtn = new QPushButton("⏭", this);
     nextBtn->setFixedSize(28, 28);
 

@@ -234,12 +234,12 @@ void LibraryScanner::refreshWatcher() {
     }
 }
 
-void LibraryScanner::startScan(const QStringList& folders) {
+void LibraryScanner::startScan(const QStringList& folders, bool toInbox) {
     if (m_scanning.exchange(true)) return;
     m_cancel.store(false);
     emit scanStarted();
 
-    (void)QtConcurrent::run([this, folders]() {
+    (void)QtConcurrent::run([this, folders, toInbox]() {
         QVector<Track> batch;
         batch.reserve(100);
         int totalCount = 0;
@@ -263,7 +263,8 @@ void LibraryScanner::startScan(const QStringList& folders) {
                 ++totalCount;
 
                 if (batch.size() >= 100) {
-                    m_db->upsertTracks(batch);
+                    if (toInbox) m_db->upsertTracksToInbox(batch);
+                    else m_db->upsertTracks(batch);
                     batch.clear();
                     QMetaObject::invokeMethod(this, [this, totalCount, name = fi.fileName()]() {
                         emit scanProgress(totalCount, name);
@@ -273,16 +274,17 @@ void LibraryScanner::startScan(const QStringList& folders) {
         }
 
         if (!batch.isEmpty()) {
-            m_db->upsertTracks(batch);
+            if (toInbox) m_db->upsertTracksToInbox(batch);
+            else m_db->upsertTracks(batch);
         }
 
-        if (!m_cancel.load()) {
+        if (!toInbox && !m_cancel.load()) {
             m_db->pruneMissingTracks(seenPaths, folders, scannedRoots);
         }
 
         m_scanning.store(false);
-        QMetaObject::invokeMethod(this, [this, totalCount, folders]() {
-            watchFolders(folders);
+        QMetaObject::invokeMethod(this, [this, totalCount, folders, toInbox]() {
+            if (!toInbox) watchFolders(folders);
             emit scanFinished(totalCount);
         }, Qt::QueuedConnection);
     });

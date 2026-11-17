@@ -15,6 +15,13 @@ class QSpinBox;
 
 namespace honeycomb {
 
+QString saveArtBytesToCache(const QByteArray& bytes, const QString& artCacheDir);
+bool writeEmbeddedCoverArt(const QString& path,
+                           bool removeOnly,
+                           const QByteArray& artBytes,
+                           const QString& mimeType);
+bool writeTrackTagsToFile(const Track& t);
+
 class TagEditorDialog : public QDialog {
     Q_OBJECT
 public:

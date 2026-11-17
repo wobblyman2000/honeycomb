@@ -35,8 +35,6 @@
 
 namespace honeycomb {
 
-namespace {
-
 QString saveArtBytesToCache(const QByteArray& bytes, const QString& artCacheDir) {
     if (bytes.isEmpty()) return {};
     const QString hash = QString::fromLatin1(
@@ -170,6 +168,8 @@ bool writeTrackTagsToFile(const Track& t) {
     ref.file()->setProperties(props);
     return ref.save();
 }
+
+namespace {
 
 template <typename Getter>
 bool allSameValue(const QVector<Track>& tracks, Getter getter) {

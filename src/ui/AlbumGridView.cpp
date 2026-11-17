@@ -239,6 +239,7 @@ void AlbumGridView::contextMenuEvent(QContextMenuEvent* event) {
     QAction* newPlAct = plMenu->addAction("New Playlist...");
 
     QAction* editTagsAct = menu.addAction("Edit Album Tags...");
+    QAction* autoTagAct = menu.addAction("Auto-Tag & Fetch Art (MusicBrainz)...");
 
     QMenu* typeMenu = menu.addMenu("Set Album Type");
     QStringList presets = {"Studio", "Live", "EP", "Single", "Compilation", "Soundtrack", "Remix"};
@@ -275,6 +276,8 @@ void AlbumGridView::contextMenuEvent(QContextMenuEvent* event) {
         emit albumAddToNewPlaylistRequested(*a);
     } else if (chosen == editTagsAct) {
         emit editAlbumTagsRequested(*a);
+    } else if (chosen == autoTagAct) {
+        emit autoTagAlbumRequested(*a);
     } else if (chosen == customTypeAct) {
         bool ok = false;
         const QString text = QInputDialog::getText(

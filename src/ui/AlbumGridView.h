@@ -72,6 +72,7 @@ signals:
     void findArtistRequested(const QString& artist);
     void albumTypeChangeRequested(const honeycomb::Album& album, const QString& albumType);
     void editAlbumTagsRequested(const honeycomb::Album& album);
+    void autoTagAlbumRequested(const honeycomb::Album& album);
     void albumAddToPlaylistRequested(const honeycomb::Album& album, const QString& playlistId);
     void albumAddToNewPlaylistRequested(const honeycomb::Album& album);
     void artworkSizeChanged(int newSizePx);

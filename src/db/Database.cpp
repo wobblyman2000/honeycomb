@@ -102,6 +102,10 @@ bool Database::open(const QString& dbPath) {
     QMutexLocker lock(&m_mutex);
     if (m_db) sqlite3_close(m_db);
 
+    if (m_db) {
+        sqlite3_close(m_db);
+        m_db = nullptr;
+    }
     const QByteArray pathUtf8 = dbPath.toUtf8();
     if (sqlite3_open(pathUtf8.constData(), &m_db) != SQLITE_OK) {
         qWarning() << "Failed to open SQLite DB:" << sqlite3_errmsg(m_db);
@@ -176,6 +180,19 @@ bool Database::initSchema() {
             track_path TEXT NOT NULL,
             PRIMARY KEY (playlist_id, position)
         );
+
+        CREATE TABLE IF NOT EXISTS radio_stations (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            url TEXT NOT NULL,
+            genre TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS podcast_feeds (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            url TEXT NOT NULL
+        );
     )SQL";
 
     char* err = nullptr;
@@ -185,22 +202,26 @@ bool Database::initSchema() {
         return false;
     }
 
-    // Migrate existing databases that lack album_type
+    // Migrate existing databases that lack album_type or is_inbox
     bool hasAlbumType = false;
+    bool hasIsInbox = false;
     sqlite3_stmt* pragmaStmt = nullptr;
     if (sqlite3_prepare_v2(m_db, "PRAGMA table_info(tracks)", -1, &pragmaStmt, nullptr) == SQLITE_OK) {
         while (sqlite3_step(pragmaStmt) == SQLITE_ROW) {
-            if (colText(pragmaStmt, 1) == "album_type") {
-                hasAlbumType = true;
-                break;
-            }
+            const QString col = colText(pragmaStmt, 1);
+            if (col == "album_type") hasAlbumType = true;
+            else if (col == "is_inbox") hasIsInbox = true;
         }
         sqlite3_finalize(pragmaStmt);
     }
     if (!hasAlbumType) {
         sqlite3_exec(m_db, "ALTER TABLE tracks ADD COLUMN album_type TEXT NOT NULL DEFAULT '';", nullptr, nullptr, nullptr);
     }
+    if (!hasIsInbox) {
+        sqlite3_exec(m_db, "ALTER TABLE tracks ADD COLUMN is_inbox INTEGER NOT NULL DEFAULT 0;", nullptr, nullptr, nullptr);
+    }
     sqlite3_exec(m_db, "CREATE INDEX IF NOT EXISTS idx_tracks_album_type ON tracks(album_type);", nullptr, nullptr, nullptr);
+    sqlite3_exec(m_db, "CREATE INDEX IF NOT EXISTS idx_tracks_is_inbox ON tracks(is_inbox);", nullptr, nullptr, nullptr);
 
     return true;
 }
@@ -500,7 +521,7 @@ int Database::trackCount() const {
     QMutexLocker lock(&m_mutex);
     sqlite3_stmt* stmt = nullptr;
     int count = 0;
-    if (sqlite3_prepare_v2(m_db, "SELECT COUNT(*) FROM tracks", -1, &stmt, nullptr) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(m_db, "SELECT COUNT(*) FROM tracks WHERE is_inbox = 0", -1, &stmt, nullptr) == SQLITE_OK) {
         if (sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
         sqlite3_finalize(stmt);
     }
@@ -615,7 +636,7 @@ QVector<Album> Database::queryAlbums(const RuleGroup& rules,
         "  MIN(path) AS first_path, "
         "  MAX(disc_number) AS discs "
         "FROM tracks "
-        "WHERE (%1) AND (%2) "
+        "WHERE is_inbox = 0 AND (%1) AND (%2) "
         "GROUP BY LOWER(alb), LOWER(alb_artist) "
         "%3"
     ).arg(ruleSql, searchSql, orderByForAlbums(sortOrder));
@@ -694,7 +715,7 @@ QVector<Track> Database::queryTracks(const RuleGroup& rules,
         "       track_number, disc_number, duration_ms, bitrate, sample_rate, "
         "       format, rating, play_count, date_added, last_played, is_compilation, album_type, art_hash "
         "FROM tracks "
-        "WHERE (%1) AND (%2) AND (%3) "
+        "WHERE is_inbox = 0 AND (%1) AND (%2) AND (%3) "
         "%4"
     ).arg(ruleSql, searchSql, extraSql, orderSql);
 
@@ -1017,6 +1038,229 @@ QVector<Track> Database::queryPlaylistTracks(const QString& playlistId, const QS
             if (t.title.isEmpty()) {
                 t.title = QFileInfo(t.path).completeBaseName();
             }
+            t.artist = colText(stmt, 3);
+            t.albumArtist = colText(stmt, 4);
+            t.album = colText(stmt, 5);
+            t.genre = colText(stmt, 6);
+            t.year = sqlite3_column_int(stmt, 7);
+            t.trackNumber = sqlite3_column_int(stmt, 8);
+            t.discNumber = sqlite3_column_int(stmt, 9);
+            t.durationMs = sqlite3_column_int64(stmt, 10);
+            t.bitrate = sqlite3_column_int(stmt, 11);
+            t.sampleRate = sqlite3_column_int(stmt, 12);
+            t.format = colText(stmt, 13);
+            t.rating = sqlite3_column_int(stmt, 14);
+            t.playCount = sqlite3_column_int(stmt, 15);
+            t.dateAdded = sqlite3_column_int64(stmt, 16);
+            t.lastPlayed = sqlite3_column_int64(stmt, 17);
+            t.isCompilation = sqlite3_column_int(stmt, 18) != 0;
+            t.albumType = colText(stmt, 19);
+            t.artHash = colText(stmt, 20);
+            tracks.append(t);
+        }
+        sqlite3_finalize(stmt);
+    }
+    return tracks;
+}
+
+QVector<Database::RadioStation> Database::loadRadioStations() const {
+    QMutexLocker lock(&m_mutex);
+    QVector<RadioStation> list;
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, "SELECT id, name, url, genre FROM radio_stations ORDER BY name COLLATE NOCASE",
+                           -1, &stmt, nullptr) == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            RadioStation s;
+            s.id = colText(stmt, 0);
+            s.name = colText(stmt, 1);
+            s.url = colText(stmt, 2);
+            s.genre = colText(stmt, 3);
+            list.append(s);
+        }
+        sqlite3_finalize(stmt);
+    }
+    return list;
+}
+
+bool Database::saveRadioStation(const RadioStation& st) {
+    QMutexLocker lock(&m_mutex);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db,
+                           "INSERT INTO radio_stations (id, name, url, genre) VALUES (?, ?, ?, ?) "
+                           "ON CONFLICT(id) DO UPDATE SET name=excluded.name, url=excluded.url, genre=excluded.genre",
+                           -1, &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, st.id.toUtf8().constData(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, st.name.toUtf8().constData(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, st.url.toUtf8().constData(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, st.genre.toUtf8().constData(), -1, SQLITE_TRANSIENT);
+    const bool ok = sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+bool Database::deleteRadioStation(const QString& id) {
+    QMutexLocker lock(&m_mutex);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, "DELETE FROM radio_stations WHERE id = ?", -1, &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, id.toUtf8().constData(), -1, SQLITE_TRANSIENT);
+    const bool ok = sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+QVector<Database::PodcastFeed> Database::loadPodcastFeeds() const {
+    QMutexLocker lock(&m_mutex);
+    QVector<PodcastFeed> list;
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, "SELECT id, title, url FROM podcast_feeds ORDER BY title COLLATE NOCASE",
+                           -1, &stmt, nullptr) == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            PodcastFeed f;
+            f.id = colText(stmt, 0);
+            f.title = colText(stmt, 1);
+            f.url = colText(stmt, 2);
+            list.append(f);
+        }
+        sqlite3_finalize(stmt);
+    }
+    return list;
+}
+
+bool Database::savePodcastFeed(const PodcastFeed& feed) {
+    QMutexLocker lock(&m_mutex);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db,
+                           "INSERT INTO podcast_feeds (id, title, url) VALUES (?, ?, ?) "
+                           "ON CONFLICT(id) DO UPDATE SET title=excluded.title, url=excluded.url",
+                           -1, &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, feed.id.toUtf8().constData(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, feed.title.toUtf8().constData(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, feed.url.toUtf8().constData(), -1, SQLITE_TRANSIENT);
+    const bool ok = sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+bool Database::deletePodcastFeed(const QString& id) {
+    QMutexLocker lock(&m_mutex);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, "DELETE FROM podcast_feeds WHERE id = ?", -1, &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, id.toUtf8().constData(), -1, SQLITE_TRANSIENT);
+    const bool ok = sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+bool Database::upsertTracksToInbox(const QVector<Track>& tracks) {
+    if (!upsertTracks(tracks)) return false;
+    QMutexLocker lock(&m_mutex);
+    sqlite3_exec(m_db, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, "UPDATE tracks SET is_inbox = 1 WHERE path = ?", -1, &stmt, nullptr) == SQLITE_OK) {
+        for (const Track& t : tracks) {
+            sqlite3_reset(stmt);
+            sqlite3_bind_text(stmt, 1, t.path.toUtf8().constData(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(stmt);
+        }
+        sqlite3_finalize(stmt);
+    }
+    sqlite3_exec(m_db, "COMMIT;", nullptr, nullptr, nullptr);
+    return true;
+}
+
+int Database::inboxCount() const {
+    QMutexLocker lock(&m_mutex);
+    sqlite3_stmt* stmt = nullptr;
+    int count = 0;
+    if (sqlite3_prepare_v2(m_db, "SELECT COUNT(*) FROM tracks WHERE is_inbox = 1", -1, &stmt, nullptr) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
+        sqlite3_finalize(stmt);
+    }
+    return count;
+}
+
+bool Database::promoteInboxTracks(const QStringList& paths) {
+    if (paths.isEmpty()) return true;
+    QMutexLocker lock(&m_mutex);
+    sqlite3_exec(m_db, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, "UPDATE tracks SET is_inbox = 0 WHERE path = ?", -1, &stmt, nullptr) == SQLITE_OK) {
+        for (const QString& p : paths) {
+            sqlite3_reset(stmt);
+            sqlite3_bind_text(stmt, 1, p.toUtf8().constData(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(stmt);
+        }
+        sqlite3_finalize(stmt);
+    }
+    sqlite3_exec(m_db, "COMMIT;", nullptr, nullptr, nullptr);
+    return true;
+}
+
+bool Database::removeTracksByPath(const QStringList& paths) {
+    if (paths.isEmpty()) return true;
+    QMutexLocker lock(&m_mutex);
+    sqlite3_exec(m_db, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, "DELETE FROM tracks WHERE path = ?", -1, &stmt, nullptr) == SQLITE_OK) {
+        for (const QString& p : paths) {
+            sqlite3_reset(stmt);
+            sqlite3_bind_text(stmt, 1, p.toUtf8().constData(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(stmt);
+        }
+        sqlite3_finalize(stmt);
+    }
+    sqlite3_exec(m_db, "COMMIT;", nullptr, nullptr, nullptr);
+    return true;
+}
+
+int Database::removeTracksUnderFolder(const QString& folderPath) {
+    QMutexLocker lock(&m_mutex);
+    QString prefix = QDir::cleanPath(folderPath);
+    if (!prefix.endsWith('/')) prefix += '/';
+    sqlite3_stmt* stmt = nullptr;
+    int removed = 0;
+    if (sqlite3_prepare_v2(m_db, "DELETE FROM tracks WHERE path LIKE ?", -1, &stmt, nullptr) == SQLITE_OK) {
+        const QString pattern = prefix + "%";
+        sqlite3_bind_text(stmt, 1, pattern.toUtf8().constData(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_DONE) {
+            removed = sqlite3_changes(m_db);
+        }
+        sqlite3_finalize(stmt);
+    }
+    return removed;
+}
+
+QVector<Track> Database::queryInboxTracks(const QString& searchText) const {
+    QMutexLocker lock(&m_mutex);
+    QVector<Track> tracks;
+    QVariantList bindValues;
+    const QString searchSql = buildSearchSql(searchText, bindValues);
+    const QString sql = QString(
+        "SELECT id, path, title, artist, album_artist, album, genre, year, "
+        "       track_number, disc_number, duration_ms, bitrate, sample_rate, "
+        "       format, rating, play_count, date_added, last_played, is_compilation, album_type, art_hash "
+        "FROM tracks "
+        "WHERE is_inbox = 1 AND (%1) "
+        "ORDER BY date_added DESC, LOWER(album), disc_number ASC, track_number ASC, LOWER(title)"
+    ).arg(searchSql);
+
+    sqlite3_stmt* stmt = nullptr;
+    const QByteArray sqlUtf8 = sql.toUtf8();
+    if (sqlite3_prepare_v2(m_db, sqlUtf8.constData(), sqlUtf8.size(), &stmt, nullptr) == SQLITE_OK) {
+        bindVariantList(stmt, bindValues);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            Track t;
+            t.id = sqlite3_column_int64(stmt, 0);
+            t.path = colText(stmt, 1);
+            t.title = colText(stmt, 2);
             t.artist = colText(stmt, 3);
             t.albumArtist = colText(stmt, 4);
             t.album = colText(stmt, 5);

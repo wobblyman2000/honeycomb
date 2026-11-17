@@ -111,8 +111,9 @@ TheaterWindow::TheaterWindow(ArtCache* artCache, QWidget* parent)
     bottom->setSpacing(12);
     auto* prevBtn = new QPushButton("⏮", this);
     m_playPauseBtn = new QPushButton("▶", this);
-    m_playPauseBtn->setFixedSize(46, 40);
-    m_playPauseBtn->setStyleSheet("background: #f5a623; color: #111; font-weight: bold; font-size: 16px; border-radius: 20px;");
+    m_playPauseBtn->setFlat(true);
+    m_playPauseBtn->setFixedSize(44, 40);
+    m_playPauseBtn->setStyleSheet("QPushButton { background: transparent; border: none; color: #f5a623; font-size: 24px; font-weight: bold; } QPushButton:hover { color: #ffd27d; }");
     auto* nextBtn = new QPushButton("⏭", this);
 
     m_seekSlider = new QSlider(Qt::Horizontal, this);

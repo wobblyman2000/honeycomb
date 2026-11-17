@@ -30,11 +30,17 @@ public:
 
     // Tracks
     bool upsertTracks(const QVector<Track>& tracks);
+    bool upsertTracksToInbox(const QVector<Track>& tracks);
     bool updateTracksTags(const QVector<Track>& tracks);
     int pruneMissingTracks(const QSet<QString>& seenPaths,
                            const QStringList& configuredFolders,
                            const QStringList& scannedRoots);
+    int removeTracksUnderFolder(const QString& folderPath);
+    bool removeTracksByPath(const QStringList& paths);
     int trackCount() const;
+    int inboxCount() const;
+    bool promoteInboxTracks(const QStringList& paths);
+    QVector<Track> queryInboxTracks(const QString& searchText = QString()) const;
     void incrementPlayCount(const QString& path);
     void setTrackRating(int64_t trackId, int rating);
     bool setAlbumType(const QString& album, const QString& albumArtist, bool isCompilation, const QString& albumType);
@@ -72,6 +78,26 @@ public:
     bool removeTrackFromPlaylist(const QString& playlistId, int position);
     bool movePlaylistTrack(const QString& playlistId, int fromPos, int toPos);
     QVector<Track> queryPlaylistTracks(const QString& playlistId, const QString& searchText = QString()) const;
+
+    // Internet Radio & Podcasts
+    struct RadioStation {
+        QString id;
+        QString name;
+        QString url;
+        QString genre;
+    };
+    struct PodcastFeed {
+        QString id;
+        QString title;
+        QString url;
+    };
+    QVector<RadioStation> loadRadioStations() const;
+    bool saveRadioStation(const RadioStation& st);
+    bool deleteRadioStation(const QString& id);
+
+    QVector<PodcastFeed> loadPodcastFeeds() const;
+    bool savePodcastFeed(const PodcastFeed& feed);
+    bool deletePodcastFeed(const QString& id);
 
 private:
     bool initSchema();

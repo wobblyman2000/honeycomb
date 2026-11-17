@@ -17,7 +17,7 @@ public:
     explicit LibraryScanner(Database* db, const QString& artCacheDir, QObject* parent = nullptr);
     ~LibraryScanner() override;
 
-    void startScan(const QStringList& folders);
+    void startScan(const QStringList& folders, bool toInbox = false);
     void cancel();
     bool isScanning() const { return m_scanning.load(); }
 

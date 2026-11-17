@@ -167,6 +167,14 @@ void TrackTableView::contextMenuEvent(QContextMenuEvent* event) {
         selectedTracks.size() > 1
             ? QString("Edit Tags (%1 tracks)...").arg(selectedTracks.size())
             : QString("Edit Tags..."));
+    QAction* autoTagAct = menu.addAction("Auto-Tag & Fetch Art (MusicBrainz)...");
+    QAction* promoteInboxAct = nullptr;
+    QAction* removeInboxAct = nullptr;
+    if (m_inboxMode) {
+        menu.addSeparator();
+        promoteInboxAct = menu.addAction("Move to Main Library");
+        removeInboxAct = menu.addAction("Remove from Inbox");
+    }
     menu.addSeparator();
     QAction* findArtistAct = !t.artist.isEmpty() ? menu.addAction(QString("Find Artist: %1").arg(t.artist)) : nullptr;
     QAction* findTrackAct = !t.title.isEmpty() ? menu.addAction(QString("Find Track: %1").arg(t.title)) : nullptr;
@@ -189,6 +197,12 @@ void TrackTableView::contextMenuEvent(QContextMenuEvent* event) {
         emit removeFromPlaylistRequested(m_activePlaylistId, idx.row());
     } else if (chosen == editTagsAct) {
         emit editTagsRequested(selectedTracks);
+    } else if (chosen == autoTagAct) {
+        emit autoTagTracksRequested(selectedTracks);
+    } else if (promoteInboxAct && chosen == promoteInboxAct) {
+        emit promoteFromInboxRequested(selectedPaths);
+    } else if (removeInboxAct && chosen == removeInboxAct) {
+        emit removeFromInboxRequested(selectedPaths);
     } else if (findArtistAct && chosen == findArtistAct) {
         emit findArtistRequested(t.artist);
     } else if (findTrackAct && chosen == findTrackAct) {
@@ -208,6 +222,17 @@ void TrackTableView::contextMenuEvent(QContextMenuEvent* event) {
             }
         }
     }
+}
+
+QStringList TrackTableView::selectedTrackPaths() const {
+    QStringList paths;
+    const QModelIndexList rows = selectionModel()->selectedRows();
+    for (const QModelIndex& idx : rows) {
+        if (idx.row() >= 0 && idx.row() < m_model->tracks().size()) {
+            paths.append(m_model->tracks().at(idx.row()).path);
+        }
+    }
+    return paths;
 }
 
 } // namespace honeycomb
