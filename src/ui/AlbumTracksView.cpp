@@ -1,8 +1,11 @@
 #include "AlbumTracksView.h"
 
+#include <QDesktopServices>
+#include <QFileInfo>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QMenu>
+#include <QUrl>
 #include <QVBoxLayout>
 
 namespace honeycomb {
@@ -108,6 +111,9 @@ AlbumTracksView::AlbumTracksView(ArtCache* artCache, QWidget* parent)
         QAction* playNextAct = menu.addAction("Play Next");
         QAction* queueAct = menu.addAction("Add to Queue");
         menu.addSeparator();
+        QAction* openFolderAct = (!t.path.isEmpty() && !t.path.startsWith("http", Qt::CaseInsensitive))
+                                     ? menu.addAction("Open Folder in File Manager")
+                                     : nullptr;
         QAction* findArtistAct = !t.artist.isEmpty() ? menu.addAction(QString("Find Artist: %1").arg(t.artist)) : nullptr;
         QAction* findTrackAct = !t.title.isEmpty() ? menu.addAction(QString("Find Track: %1").arg(t.title)) : nullptr;
         QAction* chosen = menu.exec(m_trackTable->viewport()->mapToGlobal(pos));
@@ -117,6 +123,8 @@ AlbumTracksView::AlbumTracksView(ArtCache* artCache, QWidget* parent)
             emit trackPlayNextRequested(t);
         } else if (chosen == queueAct) {
             emit trackQueueRequested(t);
+        } else if (openFolderAct && chosen == openFolderAct) {
+            QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(t.path).absolutePath()));
         } else if (findArtistAct && chosen == findArtistAct) {
             emit findArtistRequested(t.artist);
         } else if (findTrackAct && chosen == findTrackAct) {
@@ -164,19 +172,27 @@ void AlbumTracksView::showTracksForAlbum(int albumRow) {
                              .arg(yearStr.isEmpty() ? "" : "  •  " + yearStr));
 
     m_currentAlbumTracks.clear();
-    for (const Track& t : m_allTracks) {
-        const QString tAlbum = t.album.isEmpty() ? "Unknown Album" : t.album;
-        if (tAlbum.compare(a.album, Qt::CaseInsensitive) != 0) continue;
-
-        if (a.isCompilation) {
-            if (t.isCompilation || t.albumArtist.compare("Various Artists", Qt::CaseInsensitive) == 0) {
+    if (!a.folderPath.isEmpty()) {
+        for (const Track& t : m_allTracks) {
+            if (QFileInfo(t.path).absolutePath() == a.folderPath) {
                 m_currentAlbumTracks.append(t);
             }
-        } else {
-            const QString tArtist = !t.albumArtist.isEmpty() ? t.albumArtist
-                                  : (!t.artist.isEmpty() ? t.artist : "Unknown Artist");
-            if (tArtist.compare(a.albumArtist, Qt::CaseInsensitive) == 0) {
-                m_currentAlbumTracks.append(t);
+        }
+    } else {
+        for (const Track& t : m_allTracks) {
+            const QString tAlbum = t.album.isEmpty() ? "Unknown Album" : t.album;
+            if (tAlbum.compare(a.album, Qt::CaseInsensitive) != 0) continue;
+
+            if (a.isCompilation) {
+                if (t.isCompilation || t.albumArtist.compare("Various Artists", Qt::CaseInsensitive) == 0) {
+                    m_currentAlbumTracks.append(t);
+                }
+            } else {
+                const QString tArtist = !t.albumArtist.isEmpty() ? t.albumArtist
+                                      : (!t.artist.isEmpty() ? t.artist : "Unknown Artist");
+                if (tArtist.compare(a.albumArtist, Qt::CaseInsensitive) == 0) {
+                    m_currentAlbumTracks.append(t);
+                }
             }
         }
     }

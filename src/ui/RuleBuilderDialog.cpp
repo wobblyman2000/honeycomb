@@ -96,6 +96,9 @@ RuleBuilderDialog::RuleBuilderDialog(const Collection& initial, QWidget* parent)
 
     m_colBrowserCheck = new QCheckBox("Column Browser", viewGroup);
     m_colBrowserCheck->setChecked(initial.showColumnBrowser);
+    m_groupByFolderCheck = new QCheckBox("Group by Folder", viewGroup);
+    m_groupByFolderCheck->setToolTip("Group tracks by parent folder name (ideal for Top 40 / Singles Chart folders)");
+    m_groupByFolderCheck->setChecked(initial.groupByFolder);
 
     viewLayout->addWidget(new QLabel("View:", viewGroup));
     viewLayout->addWidget(m_viewModeCombo);
@@ -106,6 +109,7 @@ RuleBuilderDialog::RuleBuilderDialog(const Collection& initial, QWidget* parent)
     viewLayout->addWidget(m_artSizeSpin);
     viewLayout->addSpacing(8);
     viewLayout->addWidget(m_colBrowserCheck);
+    viewLayout->addWidget(m_groupByFolderCheck);
     viewLayout->addStretch();
     root->addWidget(viewGroup);
 
@@ -281,6 +285,7 @@ Collection RuleBuilderDialog::resultCollection() const {
     c.sortOrder = static_cast<SortOrder>(m_sortCombo->currentData().toInt());
     c.artworkSize = m_artSizeSpin->value();
     c.showColumnBrowser = m_colBrowserCheck->isChecked();
+    c.groupByFolder = m_groupByFolderCheck->isChecked();
     c.limitCount = m_limitSpin->value();
     c.limitOrder = static_cast<LimitOrder>(m_limitOrderCombo->currentData().toInt());
 

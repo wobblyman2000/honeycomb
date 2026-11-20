@@ -1,10 +1,13 @@
 #include "AlbumGridView.h"
 
 #include <QContextMenuEvent>
+#include <QDesktopServices>
+#include <QFileInfo>
 #include <QInputDialog>
 #include <QMenu>
 #include <QPainter>
 #include <QPainterPath>
+#include <QUrl>
 #include <QWheelEvent>
 
 namespace honeycomb {
@@ -240,9 +243,10 @@ void AlbumGridView::contextMenuEvent(QContextMenuEvent* event) {
 
     QAction* editTagsAct = menu.addAction("Edit Album Tags...");
     QAction* autoTagAct = menu.addAction("Auto-Tag & Fetch Art (MusicBrainz)...");
+    QAction* rgAct = menu.addAction("Analyze Volume (ReplayGain)...");
 
     QMenu* typeMenu = menu.addMenu("Set Album Type");
-    QStringList presets = {"Studio", "Live", "EP", "Single", "Compilation", "Soundtrack", "Remix"};
+    QStringList presets = {"Studio", "Live", "EP", "Single", "Compilation", "Singles Chart", "Soundtrack", "Remix"};
     for (const QString& custom : m_customAlbumTypes) {
         if (!presets.contains(custom, Qt::CaseInsensitive)) {
             presets.append(custom);
@@ -259,9 +263,15 @@ void AlbumGridView::contextMenuEvent(QContextMenuEvent* event) {
     QAction* customTypeAct = typeMenu->addAction("Custom...");
     QAction* clearTypeAct = typeMenu->addAction("Clear Album Type");
 
+    QAction* openFolderAct = nullptr;
+    if (!a->firstTrackPath.isEmpty()) {
+        menu.addSeparator();
+        openFolderAct = menu.addAction("Open Folder in File Manager");
+    }
+
     QAction* findArtistAct = nullptr;
     if (!a->albumArtist.isEmpty() && a->albumArtist != "Various Artists") {
-        menu.addSeparator();
+        if (!openFolderAct) menu.addSeparator();
         findArtistAct = menu.addAction(QString("Find Artist: %1").arg(a->albumArtist));
     }
     QAction* chosen = menu.exec(event->globalPos());
@@ -278,6 +288,10 @@ void AlbumGridView::contextMenuEvent(QContextMenuEvent* event) {
         emit editAlbumTagsRequested(*a);
     } else if (chosen == autoTagAct) {
         emit autoTagAlbumRequested(*a);
+    } else if (chosen == rgAct) {
+        emit analyzeReplayGainAlbumRequested(*a);
+    } else if (openFolderAct && chosen == openFolderAct) {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(a->firstTrackPath).absolutePath()));
     } else if (chosen == customTypeAct) {
         bool ok = false;
         const QString text = QInputDialog::getText(

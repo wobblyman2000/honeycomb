@@ -15,6 +15,7 @@
 #include "ui/ColumnBrowser.h"
 #include "ui/LyricsReader.h"
 #include "ui/MiniPlayerWindow.h"
+#include "ui/MusicExplorerPage.h"
 #include "ui/RadioPodcastPages.h"
 #include "ui/StarRatingWidget.h"
 #include "ui/TheaterWindow.h"
@@ -26,10 +27,13 @@
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMainWindow>
+#include <QMap>
 #include <QPushButton>
+#include <QShortcut>
 #include <QSlider>
 #include <QStackedWidget>
 #include <QSystemTrayIcon>
+#include <QTabBar>
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QVector>
@@ -51,6 +55,8 @@ private:
     void refreshCurrentView(bool resetColumnBrowser = true);
     void saveCurrentCollectionViewState();
     RuleGroup effectiveRules(const Collection& active) const;
+    QVector<Track> queryTracksForAlbum(const Collection& active, const Album& album) const;
+    void groupTracksAsSinglesChart(const QVector<Track>& tracks);
 
     void openAlbumDrawer(const Album& album);
     void closeAlbumDrawer();
@@ -69,10 +75,35 @@ private:
     void findTrack(const QString& title);
     void openTagEditor(const QVector<Track>& tracks);
     void openAutoTagger(const QVector<Track>& tracks);
+    void openReplayGainScanner(const QVector<Track>& tracks);
+    void openDeviceSyncDialog();
+    void openShortcutsDialog();
+    void setupShortcuts();
+    void reloadShortcuts();
+    void addBookmarkAtCurrentPos();
+    void rebuildBookmarksMenu(QMenu* menu);
     void openScrobbleSettings();
     void setSleepTimerMinutes(int minutes, bool afterTrack);
+
+    struct BrowseTabState {
+        QString title = "All Music";
+        QString collectionId;
+        QString playlistId;
+        bool isInbox = false;
+        bool isRadio = false;
+        bool isPodcasts = false;
+        bool isExplorer = false;
+        QString searchText;
+    };
+    void openNewBrowseTab(const QString& title = "All Music");
+    void closeBrowseTab(int index);
+    void saveCurrentTabState();
+    void restoreBrowseTab(int index);
+    void updateCurrentTabTitle(const QString& title);
+
     void playTrackAtIndex(int index);
     void playNext();
+    bool playNextAlbumInCollection();
     void playPrev();
     void fillAutoDjQueue(bool autoStartIfEmpty = false);
     void openAutoDjSettings();
@@ -174,6 +205,7 @@ private:
     QPushButton* m_fwdBtn = nullptr;
     QLineEdit* m_searchEdit = nullptr;
     QPushButton* m_colBrowserBtn = nullptr;
+    QPushButton* m_groupByFolderBtn = nullptr;
     QComboBox* m_viewModeCombo = nullptr;
     QComboBox* m_sortCombo = nullptr;
     QSlider* m_artZoomSlider = nullptr;
@@ -186,6 +218,11 @@ private:
     QAction* m_actWaveform = nullptr;
     QAction* m_actQueueLyrics = nullptr;
     QAction* m_actStatusBar = nullptr;
+    QAction* m_actAlphaBar = nullptr;
+
+    QWidget* m_alphaBar = nullptr;
+    QString m_alphaFilter; // "", "#", or "A".."Z"
+    QVector<QPushButton*> m_alphaButtons;
 
     ColumnBrowser* m_colBrowser = nullptr;
     QStackedWidget* m_viewStack = nullptr;
@@ -194,6 +231,7 @@ private:
     TrackTableView* m_trackTable = nullptr;
     RadioPage* m_radioPage = nullptr;
     PodcastPage* m_podcastPage = nullptr;
+    MusicExplorerPage* m_explorerPage = nullptr;
 
     // Album Grid Inline Track Drawer
     QWidget* m_albumDrawer = nullptr;
@@ -250,7 +288,15 @@ private:
     bool m_shuffle = false;
     bool m_repeat = false;
     bool m_autoDj = false;
+    bool m_continueNextAlbum = false;
     AutoDjConfig m_autoDjConfig;
+
+    // Multi-Tab Browsing & Shortcuts & Resume
+    QTabBar* m_browseTabs = nullptr;
+    QVector<BrowseTabState> m_tabStates;
+    bool m_switchingTab = false;
+    QMap<QString, QShortcut*> m_shortcuts;
+    double m_lastResumeSavedSec = 0.0;
 };
 
 } // namespace honeycomb

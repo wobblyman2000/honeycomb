@@ -3,6 +3,7 @@
 #include <QObject>
 #include <QString>
 #include <QTimer>
+#include <QVector>
 #include <mpv/client.h>
 
 namespace honeycomb {
@@ -30,6 +31,14 @@ public:
     void setCrossfadeSeconds(int seconds);
     int crossfadeSeconds() const { return m_crossfadeSec; }
 
+    struct AudioDevice {
+        QString name;
+        QString description;
+    };
+    QVector<AudioDevice> availableAudioDevices() const;
+    void setAudioDevice(const QString& deviceName);
+    QString currentAudioDevice() const { return m_audioDevice; }
+
     State state() const { return m_state; }
 
 signals:
@@ -53,6 +62,7 @@ private:
     bool m_crossfadeTriggered = false;
     QTimer* m_fadeInTimer = nullptr;
     double m_fadeInElapsed = 0.0;
+    QString m_audioDevice = "auto";
 };
 
 } // namespace honeycomb

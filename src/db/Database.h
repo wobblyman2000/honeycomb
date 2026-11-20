@@ -51,6 +51,14 @@ public:
                                const QString& searchText,
                                SortOrder sortOrder) const;
 
+    QVector<Album> queryFoldersAsAlbums(const RuleGroup& rules,
+                                        const QString& searchText,
+                                        SortOrder sortOrder) const;
+
+    QVector<Track> queryTracksInFolder(const RuleGroup& rules,
+                                       const QString& searchText,
+                                       const QString& folderPath) const;
+
     QVector<Track> queryTracks(const RuleGroup& rules,
                                const QString& searchText,
                                SortOrder sortOrder,
@@ -98,6 +106,20 @@ public:
     QVector<PodcastFeed> loadPodcastFeeds() const;
     bool savePodcastFeed(const PodcastFeed& feed);
     bool deletePodcastFeed(const QString& id);
+
+    // Bookmarks & Resume Positions
+    struct Bookmark {
+        int64_t id = 0;
+        QString trackPath;
+        double positionSec = 0.0;
+        QString label;
+    };
+    bool addBookmark(const QString& trackPath, double positionSec, const QString& label);
+    QVector<Bookmark> loadBookmarks(const QString& trackPath) const;
+    bool deleteBookmark(int64_t bookmarkId);
+
+    void saveResumePosition(const QString& trackPath, double positionSec);
+    double loadResumePosition(const QString& trackPath) const;
 
 private:
     bool initSchema();

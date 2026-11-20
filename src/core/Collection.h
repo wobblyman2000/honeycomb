@@ -45,6 +45,7 @@ struct Collection {
     SortOrder sortOrder = SortOrder::AlbumArtistYear;
     bool showColumnBrowser = false;
     bool showRightSidebar = true;
+    bool groupByFolder = false;
 
     // Smart Playlist Limits (0 = unlimited)
     int limitCount = 0;
@@ -62,6 +63,7 @@ struct Collection {
         obj["sortOrder"] = static_cast<int>(sortOrder);
         obj["showColumnBrowser"] = showColumnBrowser;
         obj["showRightSidebar"] = showRightSidebar;
+        obj["groupByFolder"] = groupByFolder;
         obj["limitCount"] = limitCount;
         obj["limitOrder"] = static_cast<int>(limitOrder);
         return obj;
@@ -79,6 +81,7 @@ struct Collection {
         c.sortOrder = static_cast<SortOrder>(obj["sortOrder"].toInt(0));
         c.showColumnBrowser = obj["showColumnBrowser"].toBool(false);
         c.showRightSidebar = obj["showRightSidebar"].toBool(true);
+        c.groupByFolder = obj["groupByFolder"].toBool(false);
         c.limitCount = obj["limitCount"].toInt(0);
         c.limitOrder = static_cast<LimitOrder>(obj["limitOrder"].toInt(0));
         return c;

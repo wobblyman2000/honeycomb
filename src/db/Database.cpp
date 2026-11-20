@@ -38,9 +38,10 @@ QString albumTypeRankExpr(const QString& typeCol, const QString& compCol) {
         "WHEN 'ep' THEN 3 "
         "WHEN 'single' THEN 4 "
         "WHEN 'compilation' THEN 5 "
-        "WHEN 'soundtrack' THEN 6 "
-        "WHEN 'remix' THEN 7 "
-        "ELSE 8 END"
+        "WHEN 'singles chart' THEN 6 "
+        "WHEN 'soundtrack' THEN 7 "
+        "WHEN 'remix' THEN 8 "
+        "ELSE 9 END"
     ).arg(typeCol, compCol);
 }
 
@@ -192,6 +193,18 @@ bool Database::initSchema() {
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
             url TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS bookmarks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            track_path TEXT NOT NULL,
+            position_sec REAL NOT NULL,
+            label TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS resume_positions (
+            track_path TEXT PRIMARY KEY,
+            position_sec REAL NOT NULL
         );
     )SQL";
 
@@ -1284,6 +1297,168 @@ QVector<Track> Database::queryInboxTracks(const QString& searchText) const {
         sqlite3_finalize(stmt);
     }
     return tracks;
+}
+
+bool Database::addBookmark(const QString& trackPath, double positionSec, const QString& label) {
+    QMutexLocker lock(&m_mutex);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, "INSERT INTO bookmarks (track_path, position_sec, label) VALUES (?, ?, ?)",
+                           -1, &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, trackPath.toUtf8().constData(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(stmt, 2, positionSec);
+    sqlite3_bind_text(stmt, 3, label.toUtf8().constData(), -1, SQLITE_TRANSIENT);
+    const bool ok = sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+QVector<Database::Bookmark> Database::loadBookmarks(const QString& trackPath) const {
+    QMutexLocker lock(&m_mutex);
+    QVector<Bookmark> list;
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, "SELECT id, track_path, position_sec, label FROM bookmarks WHERE track_path = ? ORDER BY position_sec ASC",
+                           -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, trackPath.toUtf8().constData(), -1, SQLITE_TRANSIENT);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            Bookmark b;
+            b.id = sqlite3_column_int64(stmt, 0);
+            b.trackPath = colText(stmt, 1);
+            b.positionSec = sqlite3_column_double(stmt, 2);
+            b.label = colText(stmt, 3);
+            list.append(b);
+        }
+        sqlite3_finalize(stmt);
+    }
+    return list;
+}
+
+bool Database::deleteBookmark(int64_t bookmarkId) {
+    QMutexLocker lock(&m_mutex);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(m_db, "DELETE FROM bookmarks WHERE id = ?", -1, &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_int64(stmt, 1, bookmarkId);
+    const bool ok = sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+void Database::saveResumePosition(const QString& trackPath, double positionSec) {
+    QMutexLocker lock(&m_mutex);
+    sqlite3_stmt* stmt = nullptr;
+    if (positionSec <= 2.0) {
+        if (sqlite3_prepare_v2(m_db, "DELETE FROM resume_positions WHERE track_path = ?", -1, &stmt, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(stmt, 1, trackPath.toUtf8().constData(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+        return;
+    }
+    if (sqlite3_prepare_v2(m_db,
+                           "INSERT INTO resume_positions (track_path, position_sec) VALUES (?, ?) "
+                           "ON CONFLICT(track_path) DO UPDATE SET position_sec = excluded.position_sec",
+                           -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, trackPath.toUtf8().constData(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_double(stmt, 2, positionSec);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+    }
+}
+
+double Database::loadResumePosition(const QString& trackPath) const {
+    QMutexLocker lock(&m_mutex);
+    sqlite3_stmt* stmt = nullptr;
+    double pos = 0.0;
+    if (sqlite3_prepare_v2(m_db, "SELECT position_sec FROM resume_positions WHERE track_path = ?",
+                           -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, trackPath.toUtf8().constData(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            pos = sqlite3_column_double(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+    }
+    return pos;
+}
+
+QVector<Album> Database::queryFoldersAsAlbums(const RuleGroup& rules,
+                                              const QString& searchText,
+                                              SortOrder sortOrder) const {
+    const QVector<Track> tracks = queryTracks(rules, searchText, SortOrder::AlbumArtistYear);
+    QHash<QString, Album> byDir;
+    QHash<QString, QSet<QString>> artistsPerDir;
+
+    for (const Track& t : tracks) {
+        const QFileInfo fi(t.path);
+        const QString dirPath = fi.absolutePath();
+        auto it = byDir.find(dirPath);
+        if (it == byDir.end()) {
+            Album a;
+            a.folderPath = dirPath;
+            a.album = QFileInfo(dirPath).fileName();
+            if (a.album.isEmpty()) a.album = dirPath;
+            a.albumArtist = !t.albumArtist.isEmpty() ? t.albumArtist : t.artist;
+            a.year = t.year;
+            a.genre = t.genre;
+            a.isCompilation = true;
+            a.albumType = t.albumType.isEmpty() ? QString("Singles Chart") : t.albumType;
+            a.trackCount = 1;
+            a.discCount = 1;
+            a.totalDurationMs = t.durationMs;
+            a.artHash = t.artHash;
+            a.firstTrackPath = t.path;
+            byDir.insert(dirPath, a);
+        } else {
+            Album& a = it.value();
+            a.trackCount += 1;
+            a.totalDurationMs += t.durationMs;
+            if (t.year > a.year) a.year = t.year;
+            if (a.artHash.isEmpty() && !t.artHash.isEmpty()) a.artHash = t.artHash;
+            if (a.albumType == "Singles Chart" && !t.albumType.isEmpty()) a.albumType = t.albumType;
+        }
+        if (!t.artist.isEmpty()) {
+            artistsPerDir[dirPath].insert(t.artist.toLower());
+        }
+    }
+
+    QVector<Album> result;
+    result.reserve(byDir.size());
+    for (auto it = byDir.begin(); it != byDir.end(); ++it) {
+        Album a = it.value();
+        if (artistsPerDir[it.key()].size() > 1) {
+            a.albumArtist = "Various Artists";
+        }
+        result.append(a);
+    }
+
+    std::sort(result.begin(), result.end(), [sortOrder](const Album& a, const Album& b) {
+        if (sortOrder == SortOrder::YearDesc) {
+            if (a.year != b.year) return a.year > b.year;
+        }
+        return a.album.compare(b.album, Qt::CaseInsensitive) < 0;
+    });
+    return result;
+}
+
+QVector<Track> Database::queryTracksInFolder(const RuleGroup& rules,
+                                             const QString& searchText,
+                                             const QString& folderPath) const {
+    const QVector<Track> all = queryTracks(rules, searchText, SortOrder::AlbumArtistYear);
+    const QString cleanDir = QDir::cleanPath(folderPath);
+    QVector<Track> out;
+    for (const Track& t : all) {
+        if (QDir::cleanPath(QFileInfo(t.path).absolutePath()) == cleanDir) {
+            out.append(t);
+        }
+    }
+    std::sort(out.begin(), out.end(), [](const Track& x, const Track& y) {
+        if (x.discNumber != y.discNumber) return x.discNumber < y.discNumber;
+        if (x.trackNumber != y.trackNumber) return x.trackNumber < y.trackNumber;
+        return QFileInfo(x.path).fileName().compare(QFileInfo(y.path).fileName(), Qt::CaseInsensitive) < 0;
+    });
+    return out;
 }
 
 } // namespace honeycomb

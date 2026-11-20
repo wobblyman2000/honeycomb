@@ -201,4 +201,42 @@ void AudioEngine::processMpvEvents() {
     }
 }
 
+QVector<AudioEngine::AudioDevice> AudioEngine::availableAudioDevices() const {
+    QVector<AudioDevice> result;
+    if (!m_mpv) return result;
+
+    mpv_node node;
+    if (mpv_get_property(m_mpv, "audio-device-list", MPV_FORMAT_NODE, &node) < 0) {
+        return result;
+    }
+
+    if (node.format == MPV_FORMAT_NODE_ARRAY && node.u.list) {
+        for (int i = 0; i < node.u.list->num; ++i) {
+            const mpv_node& entry = node.u.list->values[i];
+            if (entry.format != MPV_FORMAT_NODE_MAP || !entry.u.list) continue;
+            AudioDevice dev;
+            for (int j = 0; j < entry.u.list->num; ++j) {
+                const char* key = entry.u.list->keys[j];
+                const mpv_node& val = entry.u.list->values[j];
+                if (!key || val.format != MPV_FORMAT_STRING || !val.u.string) continue;
+                if (qstrcmp(key, "name") == 0) dev.name = QString::fromUtf8(val.u.string);
+                else if (qstrcmp(key, "description") == 0) dev.description = QString::fromUtf8(val.u.string);
+            }
+            if (!dev.name.isEmpty()) {
+                if (dev.description.isEmpty()) dev.description = dev.name;
+                result.append(dev);
+            }
+        }
+    }
+    mpv_free_node_contents(&node);
+    return result;
+}
+
+void AudioEngine::setAudioDevice(const QString& deviceName) {
+    m_audioDevice = deviceName.isEmpty() ? QString("auto") : deviceName;
+    if (!m_mpv) return;
+    const QByteArray utf8 = m_audioDevice.toUtf8();
+    mpv_set_property_string(m_mpv, "audio-device", utf8.constData());
+}
+
 } // namespace honeycomb

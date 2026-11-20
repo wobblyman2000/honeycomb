@@ -46,6 +46,8 @@ signals:
     void findTrackRequested(const QString& title);
     void editTagsRequested(const QVector<honeycomb::Track>& tracks);
     void autoTagTracksRequested(const QVector<honeycomb::Track>& tracks);
+    void analyzeReplayGainTracksRequested(const QVector<honeycomb::Track>& tracks);
+    void groupAsSinglesChartRequested(const QVector<honeycomb::Track>& tracks);
     void addToPlaylistRequested(const QString& playlistId, const QStringList& trackPaths);
     void addToNewPlaylistRequested(const QStringList& trackPaths);
     void removeFromPlaylistRequested(const QString& playlistId, int row);

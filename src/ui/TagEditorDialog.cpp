@@ -338,7 +338,7 @@ TagEditorDialog::TagEditorDialog(const QVector<Track>& tracks,
     const bool sameType = allSameValue(m_tracks, [](const Track& t) { return t.albumType; });
     m_comboAlbumType = new QComboBox(this);
     m_comboAlbumType->setEditable(true);
-    QStringList types = {"", "Studio", "Live", "EP", "Single", "Compilation", "Soundtrack", "Remix"};
+    QStringList types = {"", "Studio", "Live", "EP", "Single", "Compilation", "Singles Chart", "Soundtrack", "Remix"};
     if (m_db) {
         for (const QString& t : m_db->distinctAlbumTypes()) {
             if (!types.contains(t, Qt::CaseInsensitive)) types.append(t);

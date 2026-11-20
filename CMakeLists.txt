@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Honeycomb VERSION 0.1.0 LANGUAGES CXX)
+project(Honeycomb VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -55,6 +55,16 @@ add_executable(honeycomb
     src/ui/AutoTagDialog.cpp
     src/ui/RadioPodcastPages.h
     src/ui/RadioPodcastPages.cpp
+    src/ui/MusicExplorerPage.h
+    src/ui/MusicExplorerPage.cpp
+    src/ui/ReplayGainDialog.h
+    src/ui/ReplayGainDialog.cpp
+    src/ui/DeviceSyncDialog.h
+    src/ui/DeviceSyncDialog.cpp
+    src/ui/ThemeManager.h
+    src/ui/ThemeManager.cpp
+    src/ui/ShortcutsDialog.h
+    src/ui/ShortcutsDialog.cpp
     src/ui/MainWindow.cpp
 )
 

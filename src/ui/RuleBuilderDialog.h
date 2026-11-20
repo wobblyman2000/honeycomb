@@ -46,6 +46,7 @@ private:
     QComboBox* m_sortCombo = nullptr;
     QSpinBox* m_artSizeSpin = nullptr;
     QCheckBox* m_colBrowserCheck = nullptr;
+    QCheckBox* m_groupByFolderCheck = nullptr;
     QSpinBox* m_limitSpin = nullptr;
     QComboBox* m_limitOrderCombo = nullptr;
     QVBoxLayout* m_rulesLayout = nullptr;

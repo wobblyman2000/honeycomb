@@ -1,8 +1,11 @@
 #include "TrackTableView.h"
 
 #include <QContextMenuEvent>
+#include <QDesktopServices>
+#include <QFileInfo>
 #include <QHeaderView>
 #include <QMenu>
+#include <QUrl>
 
 namespace honeycomb {
 
@@ -168,6 +171,8 @@ void TrackTableView::contextMenuEvent(QContextMenuEvent* event) {
             ? QString("Edit Tags (%1 tracks)...").arg(selectedTracks.size())
             : QString("Edit Tags..."));
     QAction* autoTagAct = menu.addAction("Auto-Tag & Fetch Art (MusicBrainz)...");
+    QAction* rgAct = menu.addAction("Analyze Volume (ReplayGain)...");
+    QAction* singlesChartAct = menu.addAction("Group as Singles Chart (from Folder Name)");
     QAction* promoteInboxAct = nullptr;
     QAction* removeInboxAct = nullptr;
     if (m_inboxMode) {
@@ -176,6 +181,9 @@ void TrackTableView::contextMenuEvent(QContextMenuEvent* event) {
         removeInboxAct = menu.addAction("Remove from Inbox");
     }
     menu.addSeparator();
+    QAction* openFolderAct = (!t.path.isEmpty() && !t.path.startsWith("http", Qt::CaseInsensitive))
+                                 ? menu.addAction("Open Folder in File Manager")
+                                 : nullptr;
     QAction* findArtistAct = !t.artist.isEmpty() ? menu.addAction(QString("Find Artist: %1").arg(t.artist)) : nullptr;
     QAction* findTrackAct = !t.title.isEmpty() ? menu.addAction(QString("Find Track: %1").arg(t.title)) : nullptr;
 
@@ -199,10 +207,16 @@ void TrackTableView::contextMenuEvent(QContextMenuEvent* event) {
         emit editTagsRequested(selectedTracks);
     } else if (chosen == autoTagAct) {
         emit autoTagTracksRequested(selectedTracks);
+    } else if (chosen == rgAct) {
+        emit analyzeReplayGainTracksRequested(selectedTracks);
+    } else if (chosen == singlesChartAct) {
+        emit groupAsSinglesChartRequested(selectedTracks);
     } else if (promoteInboxAct && chosen == promoteInboxAct) {
         emit promoteFromInboxRequested(selectedPaths);
     } else if (removeInboxAct && chosen == removeInboxAct) {
         emit removeFromInboxRequested(selectedPaths);
+    } else if (openFolderAct && chosen == openFolderAct) {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(t.path).absolutePath()));
     } else if (findArtistAct && chosen == findArtistAct) {
         emit findArtistRequested(t.artist);
     } else if (findTrackAct && chosen == findTrackAct) {

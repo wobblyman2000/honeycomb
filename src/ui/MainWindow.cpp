@@ -1,18 +1,25 @@
 #include "MainWindow.h"
 #include "AppIcon.h"
 #include "AutoTagDialog.h"
+#include "DeviceSyncDialog.h"
+#include "ReplayGainDialog.h"
 #include "RuleBuilderDialog.h"
+#include "ShortcutsDialog.h"
 #include "TagEditorDialog.h"
+#include "ThemeManager.h"
 
 #include <QActionGroup>
 #include <QApplication>
 #include <QCheckBox>
+#include <QColorDialog>
 #include <QDateTime>
+#include <QDesktopServices>
 #include <QDialogButtonBox>
 #include <QDir>
 #include <QFile>
 #include <QFileDialog>
 #include <QFormLayout>
+#include <QUrl>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QInputDialog>
@@ -31,6 +38,7 @@
 #include <QUuid>
 #include <QVBoxLayout>
 #include <algorithm>
+#include <functional>
 
 namespace honeycomb {
 
@@ -84,6 +92,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     });
 
     setupUi();
+    setupShortcuts();
     setupTrayAndMpris(cacheDir);
     loadCollectionsSidebar();
 
@@ -124,6 +133,14 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
             m_scrobbledCurrent = true;
             m_scrobble->sendScrobble(m_queue[m_queueIndex], m_trackStartedEpoch);
         }
+
+        // Auto-save resume position for long files (>= 10 min) or podcasts
+        if (m_queueIndex >= 0 && m_queueIndex < m_queue.size() &&
+            (m_currentDurationSec >= 600.0 || m_queue[m_queueIndex].format == "PODCAST") &&
+            qAbs(pos - m_lastResumeSavedSec) >= 10.0) {
+            m_lastResumeSavedSec = pos;
+            m_db.saveResumePosition(m_queue[m_queueIndex].path, pos);
+        }
     };
     auto onDuration = [this](double dur) {
         m_currentDurationSec = dur;
@@ -137,6 +154,9 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     };
 
     auto onTrackDone = [this]() {
+        if (m_queueIndex >= 0 && m_queueIndex < m_queue.size()) {
+            m_db.saveResumePosition(m_queue[m_queueIndex].path, 0.0);
+        }
         if (m_sleepAfterTrack) {
             m_sleepAfterTrack = false;
             activeStop();
@@ -281,8 +301,34 @@ void MainWindow::setupUi() {
     // --- CENTER MAIN PANEL ---
     auto* centerPane = new QWidget(mainSplitter);
     auto* centerLayout = new QVBoxLayout(centerPane);
-    centerLayout->setContentsMargins(8, 10, 8, 8);
-    centerLayout->setSpacing(8);
+    centerLayout->setContentsMargins(8, 6, 8, 8);
+    centerLayout->setSpacing(6);
+
+    // Multi-Tab Browsing Bar
+    auto* tabBarRow = new QHBoxLayout();
+    tabBarRow->setContentsMargins(0, 0, 0, 0);
+    tabBarRow->setSpacing(4);
+    m_browseTabs = new QTabBar(centerPane);
+    m_browseTabs->setTabsClosable(true);
+    m_browseTabs->setExpanding(false);
+    m_browseTabs->setElideMode(Qt::ElideRight);
+    auto* newTabBtn = new QPushButton("+", centerPane);
+    newTabBtn->setFixedSize(26, 24);
+    newTabBtn->setToolTip("Open New Tab (Ctrl+T)");
+    tabBarRow->addWidget(m_browseTabs, 1);
+    tabBarRow->addWidget(newTabBtn);
+    centerLayout->addLayout(tabBarRow);
+
+    m_tabStates.clear();
+    m_tabStates.append(BrowseTabState{});
+    m_browseTabs->addTab("All Music");
+    connect(newTabBtn, &QPushButton::clicked, this, [this]() { openNewBrowseTab(); });
+    connect(m_browseTabs, &QTabBar::tabCloseRequested, this, &MainWindow::closeBrowseTab);
+    connect(m_browseTabs, &QTabBar::currentChanged, this, [this](int idx) {
+        if (!m_switchingTab && idx >= 0 && idx < m_tabStates.size()) {
+            restoreBrowseTab(idx);
+        }
+    });
 
     auto* topBar = new QHBoxLayout();
     m_backBtn = new QPushButton("◀", centerPane);
@@ -301,6 +347,10 @@ void MainWindow::setupUi() {
     m_colBrowserBtn = new QPushButton("Browser", centerPane);
     m_colBrowserBtn->setCheckable(true);
     m_colBrowserBtn->setToolTip("Toggle Column Browser (Genre → Album Artist → Album)");
+
+    m_groupByFolderBtn = new QPushButton("By Folder", centerPane);
+    m_groupByFolderBtn->setCheckable(true);
+    m_groupByFolderBtn->setToolTip("Group albums by parent folder name (ideal for Top 40 / Singles Chart folders)");
 
     m_viewModeCombo = new QComboBox(centerPane);
     m_viewModeCombo->addItem("Album Covers", static_cast<int>(ViewMode::AlbumCovers));
@@ -332,12 +382,46 @@ void MainWindow::setupUi() {
     topBar->addWidget(m_fwdBtn);
     topBar->addWidget(m_searchEdit, 1);
     topBar->addWidget(m_colBrowserBtn);
+    topBar->addWidget(m_groupByFolderBtn);
     topBar->addWidget(m_viewModeCombo);
     topBar->addWidget(m_sortCombo);
     topBar->addWidget(m_artZoomSlider);
     topBar->addWidget(m_editColBtn);
     topBar->addWidget(m_panelsBtn);
     centerLayout->addLayout(topBar);
+
+    // A-Z Quick Filter Toolbar
+    m_alphaBar = new QWidget(centerPane);
+    auto* alphaLayout = new QHBoxLayout(m_alphaBar);
+    alphaLayout->setContentsMargins(0, 0, 0, 0);
+    alphaLayout->setSpacing(2);
+    m_alphaButtons.clear();
+
+    QStringList alphaKeys = {"All", "#"};
+    for (char ch = 'A'; ch <= 'Z'; ++ch) {
+        alphaKeys.append(QString(QChar(ch)));
+    }
+    for (const QString& key : alphaKeys) {
+        auto* btn = new QPushButton(key, m_alphaBar);
+        btn->setCheckable(true);
+        btn->setChecked(key == "All");
+        btn->setFixedHeight(22);
+        btn->setMinimumWidth(key == "All" ? 32 : 22);
+        btn->setStyleSheet("QPushButton { padding: 1px 4px; font-size: 11px; border-radius: 3px; }");
+        connect(btn, &QPushButton::clicked, this, [this, key]() {
+            const QString nextFilter = (key == "All" || m_alphaFilter == key) ? QString() : key;
+            m_alphaFilter = nextFilter;
+            for (QPushButton* b : m_alphaButtons) {
+                const bool active = m_alphaFilter.isEmpty() ? (b->text() == "All") : (b->text() == m_alphaFilter);
+                b->setChecked(active);
+            }
+            refreshCurrentView(false);
+        });
+        m_alphaButtons.append(btn);
+        alphaLayout->addWidget(btn);
+    }
+    alphaLayout->addStretch();
+    centerLayout->addWidget(m_alphaBar);
 
     // Inbox Action Bar (shown only when viewing Inbox)
     m_inboxBar = new QWidget(centerPane);
@@ -395,14 +479,18 @@ void MainWindow::setupUi() {
     m_viewStack->addWidget(m_trackTable);
     m_radioPage = new RadioPage(&m_db, m_viewStack);
     m_podcastPage = new PodcastPage(&m_db, m_viewStack);
+    m_explorerPage = new MusicExplorerPage(&m_db, m_artCache, m_viewStack);
     m_viewStack->addWidget(m_radioPage);
     m_viewStack->addWidget(m_podcastPage);
+    m_viewStack->addWidget(m_explorerPage);
     connect(m_radioPage, &RadioPage::streamPlayRequested, this, [this](const Track& t) {
         playQueue({t}, 0);
     });
     connect(m_podcastPage, &PodcastPage::streamPlayRequested, this, [this](const Track& t) {
         playQueue({t}, 0);
     });
+    connect(m_explorerPage, &MusicExplorerPage::playTracksRequested, this, &MainWindow::playQueue);
+    connect(m_explorerPage, &MusicExplorerPage::findArtistInLibraryRequested, this, &MainWindow::findArtist);
     centerSplitter->addWidget(m_viewStack);
 
     // Inline Album Track Drawer (shown when clicking an album in AlbumCovers)
@@ -592,6 +680,7 @@ void MainWindow::setupUi() {
         const bool showWaveform = uiSettings.value("ui/panels/waveform", true).toBool();
         const bool showQueueLyrics = uiSettings.value("ui/panels/queueLyrics", true).toBool();
         const bool showStatusBar = uiSettings.value("ui/panels/statusBar", true).toBool();
+        const bool showAlphaBar = uiSettings.value("ui/panels/alphaBar", true).toBool();
 
         m_leftPane->setVisible(showLeft);
         m_rightPane->setVisible(showRight);
@@ -599,6 +688,7 @@ void MainWindow::setupUi() {
         m_waveform->setVisible(showWaveform);
         m_rightTabs->setVisible(showQueueLyrics);
         m_statusBar->setVisible(showStatusBar);
+        m_alphaBar->setVisible(showAlphaBar);
 
         auto* panelsMenu = new QMenu(m_panelsBtn);
         m_actLeftSidebar = panelsMenu->addAction("Left Sidebar (Collections & Playlists)");
@@ -621,6 +711,14 @@ void MainWindow::setupUi() {
         m_actColBrowser->setCheckable(true);
         connect(m_actColBrowser, &QAction::toggled, this, [this](bool on) {
             m_colBrowserBtn->setChecked(on);
+        });
+
+        m_actAlphaBar = panelsMenu->addAction("A–Z Quick Filter Bar");
+        m_actAlphaBar->setCheckable(true);
+        m_actAlphaBar->setChecked(showAlphaBar);
+        connect(m_actAlphaBar, &QAction::toggled, this, [this](bool on) {
+            m_alphaBar->setVisible(on);
+            QSettings("Honeycomb", "Honeycomb").setValue("ui/panels/alphaBar", on);
         });
 
         m_actStatusBar = panelsMenu->addAction("Status Bar (Selection & Queue)");
@@ -656,6 +754,36 @@ void MainWindow::setupUi() {
             m_rightTabs->setVisible(on);
             QSettings("Honeycomb", "Honeycomb").setValue("ui/panels/queueLyrics", on);
         });
+
+        panelsMenu->addSeparator();
+
+        QMenu* themeMenu = panelsMenu->addMenu("Theme & Accent Color");
+        auto* themeGrp = new QActionGroup(themeMenu);
+        const QString curTheme = ThemeManager::currentThemeId();
+        auto addThemeOpt = [&](const QString& label, const QString& id) {
+            QAction* act = themeMenu->addAction(label);
+            act->setCheckable(true);
+            act->setChecked(curTheme == id);
+            themeGrp->addAction(act);
+            connect(act, &QAction::triggered, this, [id]() {
+                ThemeManager::applyTheme(qApp, id, ThemeManager::currentAccentHex());
+            });
+        };
+        addThemeOpt("Honeycomb Dark", "honeycomb_dark");
+        addThemeOpt("OLED Black", "oled_black");
+        addThemeOpt("Midnight Blue", "midnight_blue");
+        addThemeOpt("Clean Light", "clean_light");
+        themeMenu->addSeparator();
+        QAction* accentAct = themeMenu->addAction("Choose Accent Color...");
+        connect(accentAct, &QAction::triggered, this, [this]() {
+            const QColor picked = QColorDialog::getColor(QColor(ThemeManager::currentAccentHex()), this, "Choose Accent Color");
+            if (picked.isValid()) {
+                ThemeManager::applyTheme(qApp, ThemeManager::currentThemeId(), picked.name());
+            }
+        });
+
+        QAction* shortcutsAct = panelsMenu->addAction("Keyboard Shortcuts...");
+        connect(shortcutsAct, &QAction::triggered, this, &MainWindow::openShortcutsDialog);
 
         panelsMenu->addSeparator();
 
@@ -769,6 +897,42 @@ void MainWindow::setupUi() {
     QAction* scrobbleAct = audioMenu->addAction("Scrobbling (ListenBrainz / Last.fm)...");
     connect(scrobbleAct, &QAction::triggered, this, &MainWindow::openScrobbleSettings);
 
+    audioMenu->addSeparator();
+    const QString savedOutDev = audioSettings.value("audio/outputDevice", "auto").toString();
+    m_audio->setAudioDevice(savedOutDev);
+    QMenu* outDevMenu = audioMenu->addMenu("Output Device");
+    connect(outDevMenu, &QMenu::aboutToShow, this, [this, outDevMenu]() {
+        outDevMenu->clear();
+        auto* grp = new QActionGroup(outDevMenu);
+        const QString cur = m_audio->currentAudioDevice();
+        const auto devices = m_audio->availableAudioDevices();
+        for (const auto& dev : devices) {
+            QAction* act = outDevMenu->addAction(dev.description);
+            act->setCheckable(true);
+            act->setChecked(dev.name == cur);
+            grp->addAction(act);
+            connect(act, &QAction::triggered, this, [this, name = dev.name]() {
+                m_audio->setAudioDevice(name);
+                QSettings("Honeycomb", "Honeycomb").setValue("audio/outputDevice", name);
+            });
+        }
+    });
+
+    QMenu* bookmarksMenu = audioMenu->addMenu("Bookmarks");
+    connect(bookmarksMenu, &QMenu::aboutToShow, this, [this, bookmarksMenu]() {
+        rebuildBookmarksMenu(bookmarksMenu);
+    });
+
+    audioMenu->addSeparator();
+    m_continueNextAlbum = audioSettings.value("playback/continueNextAlbum", false).toBool();
+    QAction* nextAlbumAct = audioMenu->addAction("Continue to Next Album in Collection");
+    nextAlbumAct->setCheckable(true);
+    nextAlbumAct->setChecked(m_continueNextAlbum);
+    connect(nextAlbumAct, &QAction::toggled, this, [this](bool on) {
+        m_continueNextAlbum = on;
+        QSettings("Honeycomb", "Honeycomb").setValue("playback/continueNextAlbum", on);
+    });
+
     audioBtn->setMenu(audioMenu);
 
     m_castBtn = new QPushButton("Cast ▾", transportBar);
@@ -831,6 +995,21 @@ void MainWindow::setupUi() {
             activateInbox();
             return;
         }
+        if (id == "__explorer__") {
+            m_viewingInbox = false;
+            if (m_inboxBar) m_inboxBar->setVisible(false);
+            if (m_trackTable) m_trackTable->setInboxMode(false);
+            m_activePlaylistId.clear();
+            m_activeCollectionId.clear();
+            closeAlbumDrawer();
+            m_viewStack->setCurrentWidget(m_explorerPage);
+            updateStatusSelection("Music Explorer");
+            updateCurrentTabTitle("Music Explorer");
+            if (m_queueIndex >= 0 && m_queueIndex < m_queue.size()) {
+                m_explorerPage->onNowPlayingTrackChanged(m_queue[m_queueIndex]);
+            }
+            return;
+        }
         if (id == "__radio__") {
             m_viewingInbox = false;
             if (m_inboxBar) m_inboxBar->setVisible(false);
@@ -840,6 +1019,7 @@ void MainWindow::setupUi() {
             closeAlbumDrawer();
             m_viewStack->setCurrentWidget(m_radioPage);
             updateStatusSelection("Internet Radio");
+            updateCurrentTabTitle("Internet Radio");
             return;
         }
         if (id == "__podcasts__") {
@@ -851,6 +1031,7 @@ void MainWindow::setupUi() {
             closeAlbumDrawer();
             m_viewStack->setCurrentWidget(m_podcastPage);
             updateStatusSelection("Podcasts");
+            updateCurrentTabTitle("Podcasts");
             return;
         }
         if (item->data(Qt::UserRole + 1).toBool()) {
@@ -937,6 +1118,11 @@ void MainWindow::setupUi() {
         saveCurrentCollectionViewState();
         refreshCurrentView(on);
     });
+    connect(m_groupByFolderBtn, &QPushButton::toggled, this, [this](bool) {
+        closeAlbumDrawer();
+        saveCurrentCollectionViewState();
+        refreshCurrentView(false);
+    });
     connect(m_colBrowser, &ColumnBrowser::filterChanged, this, [this]() {
         refreshCurrentView(false);
     });
@@ -965,8 +1151,7 @@ void MainWindow::setupUi() {
     connect(m_albumGrid, &AlbumGridView::albumActivated, this, [this](const Album& alb) {
         for (const auto& c : m_collections) {
             if (c.id == m_activeCollectionId) {
-                const auto tracks = m_db.queryTracks(effectiveRules(c), m_searchEdit->text(), SortOrder::AlbumArtistYear, alb.album, alb.albumArtist);
-                playQueue(tracks, 0);
+                playQueue(queryTracksForAlbum(c, alb), 0);
                 break;
             }
         }
@@ -974,8 +1159,7 @@ void MainWindow::setupUi() {
     connect(m_albumGrid, &AlbumGridView::albumPlayNextRequested, this, [this](const Album& alb) {
         for (const auto& c : m_collections) {
             if (c.id == m_activeCollectionId) {
-                const auto tracks = m_db.queryTracks(effectiveRules(c), m_searchEdit->text(), SortOrder::AlbumArtistYear, alb.album, alb.albumArtist);
-                playNextTracks(tracks);
+                playNextTracks(queryTracksForAlbum(c, alb));
                 break;
             }
         }
@@ -983,7 +1167,7 @@ void MainWindow::setupUi() {
     connect(m_albumGrid, &AlbumGridView::albumQueueRequested, this, [this](const Album& alb) {
         for (const auto& c : m_collections) {
             if (c.id == m_activeCollectionId) {
-                const auto tracks = m_db.queryTracks(effectiveRules(c), m_searchEdit->text(), SortOrder::AlbumArtistYear, alb.album, alb.albumArtist);
+                const auto tracks = queryTracksForAlbum(c, alb);
                 for (const auto& t : tracks) enqueueTrack(t);
                 break;
             }
@@ -991,15 +1175,26 @@ void MainWindow::setupUi() {
     });
     connect(m_albumGrid, &AlbumGridView::findArtistRequested, this, &MainWindow::findArtist);
     connect(m_albumGrid, &AlbumGridView::albumTypeChangeRequested, this, [this](const Album& alb, const QString& albumType) {
-        if (m_db.setAlbumType(alb.album, alb.albumArtist, alb.isCompilation, albumType)) {
+        if (!alb.folderPath.isEmpty()) {
+            for (const auto& c : m_collections) {
+                if (c.id == m_activeCollectionId) {
+                    QVector<Track> tracks = queryTracksForAlbum(c, alb);
+                    for (Track& t : tracks) {
+                        t.albumType = albumType;
+                    }
+                    m_db.upsertTracks(tracks);
+                    refreshCurrentView(true);
+                    break;
+                }
+            }
+        } else if (m_db.setAlbumType(alb.album, alb.albumArtist, alb.isCompilation, albumType)) {
             refreshCurrentView(true);
         }
     });
     connect(m_albumGrid, &AlbumGridView::editAlbumTagsRequested, this, [this](const Album& alb) {
         for (const auto& c : m_collections) {
             if (c.id == m_activeCollectionId) {
-                const auto tracks = m_db.queryTracks(effectiveRules(c), m_searchEdit->text(), SortOrder::AlbumArtistYear, alb.album, alb.albumArtist);
-                openTagEditor(tracks);
+                openTagEditor(queryTracksForAlbum(c, alb));
                 break;
             }
         }
@@ -1007,8 +1202,15 @@ void MainWindow::setupUi() {
     connect(m_albumGrid, &AlbumGridView::autoTagAlbumRequested, this, [this](const Album& alb) {
         for (const auto& c : m_collections) {
             if (c.id == m_activeCollectionId) {
-                const auto tracks = m_db.queryTracks(effectiveRules(c), m_searchEdit->text(), SortOrder::AlbumArtistYear, alb.album, alb.albumArtist);
-                openAutoTagger(tracks);
+                openAutoTagger(queryTracksForAlbum(c, alb));
+                break;
+            }
+        }
+    });
+    connect(m_albumGrid, &AlbumGridView::analyzeReplayGainAlbumRequested, this, [this](const Album& alb) {
+        for (const auto& c : m_collections) {
+            if (c.id == m_activeCollectionId) {
+                openReplayGainScanner(queryTracksForAlbum(c, alb));
                 break;
             }
         }
@@ -1016,7 +1218,7 @@ void MainWindow::setupUi() {
     connect(m_albumGrid, &AlbumGridView::albumAddToPlaylistRequested, this, [this](const Album& alb, const QString& plId) {
         for (const auto& c : m_collections) {
             if (c.id == m_activeCollectionId) {
-                const auto tracks = m_db.queryTracks(effectiveRules(c), m_searchEdit->text(), SortOrder::AlbumArtistYear, alb.album, alb.albumArtist);
+                const auto tracks = queryTracksForAlbum(c, alb);
                 QStringList paths;
                 for (const Track& t : tracks) paths.append(t.path);
                 m_db.addTracksToPlaylist(plId, paths);
@@ -1028,7 +1230,7 @@ void MainWindow::setupUi() {
     connect(m_albumGrid, &AlbumGridView::albumAddToNewPlaylistRequested, this, [this](const Album& alb) {
         for (const auto& c : m_collections) {
             if (c.id == m_activeCollectionId) {
-                const auto tracks = m_db.queryTracks(effectiveRules(c), m_searchEdit->text(), SortOrder::AlbumArtistYear, alb.album, alb.albumArtist);
+                const auto tracks = queryTracksForAlbum(c, alb);
                 QStringList paths;
                 for (const Track& t : tracks) paths.append(t.path);
                 onNewPlaylist(paths);
@@ -1066,6 +1268,9 @@ void MainWindow::setupUi() {
             QAction* playNextAct = menu.addAction("Play Next");
             QAction* queueAct = menu.addAction("Add to Queue");
             menu.addSeparator();
+            QAction* openFolderAct = (!t.path.isEmpty() && !t.path.startsWith("http", Qt::CaseInsensitive))
+                                         ? menu.addAction("Open Folder in File Manager")
+                                         : nullptr;
             QAction* findArtistAct = !t.artist.isEmpty() ? menu.addAction(QString("Find Artist: %1").arg(t.artist)) : nullptr;
             QAction* findTrackAct = !t.title.isEmpty() ? menu.addAction(QString("Find Track: %1").arg(t.title)) : nullptr;
             QAction* chosen = menu.exec(tbl->viewport()->mapToGlobal(pos));
@@ -1075,6 +1280,8 @@ void MainWindow::setupUi() {
                 playNextTrack(t);
             } else if (chosen == queueAct) {
                 enqueueTrack(t);
+            } else if (openFolderAct && chosen == openFolderAct) {
+                QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(t.path).absolutePath()));
             } else if (findArtistAct && chosen == findArtistAct) {
                 findArtist(t.artist);
             } else if (findTrackAct && chosen == findTrackAct) {
@@ -1109,6 +1316,8 @@ void MainWindow::setupUi() {
     });
     connect(m_trackTable, &TrackTableView::editTagsRequested, this, &MainWindow::openTagEditor);
     connect(m_trackTable, &TrackTableView::autoTagTracksRequested, this, &MainWindow::openAutoTagger);
+    connect(m_trackTable, &TrackTableView::analyzeReplayGainTracksRequested, this, &MainWindow::openReplayGainScanner);
+    connect(m_trackTable, &TrackTableView::groupAsSinglesChartRequested, this, &MainWindow::groupTracksAsSinglesChart);
     connect(m_trackTable, &TrackTableView::addToPlaylistRequested, this, [this](const QString& plId, const QStringList& paths) {
         m_db.addTracksToPlaylist(plId, paths);
         loadCollectionsSidebar();
@@ -1166,6 +1375,9 @@ void MainWindow::setupUi() {
         QAction* playAct = menu.addAction("Play Now");
         QAction* removeAct = menu.addAction("Remove from Queue");
         menu.addSeparator();
+        QAction* openFolderAct = (!t.path.isEmpty() && !t.path.startsWith("http", Qt::CaseInsensitive))
+                                     ? menu.addAction("Open Folder in File Manager")
+                                     : nullptr;
         QAction* findArtistAct = !t.artist.isEmpty() ? menu.addAction(QString("Find Artist: %1").arg(t.artist)) : nullptr;
         QAction* findTrackAct = !t.title.isEmpty() ? menu.addAction(QString("Find Track: %1").arg(t.title)) : nullptr;
 
@@ -1186,6 +1398,8 @@ void MainWindow::setupUi() {
                 }
             }
             refreshQueueWidget();
+        } else if (openFolderAct && chosen == openFolderAct) {
+            QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(t.path).absolutePath()));
         } else if (findArtistAct && chosen == findArtistAct) {
             findArtist(t.artist);
         } else if (findTrackAct && chosen == findTrackAct) {
@@ -1258,6 +1472,11 @@ void MainWindow::loadCollectionsSidebar() {
         inboxItem->setData(Qt::UserRole, "__inbox__");
         inboxItem->setData(Qt::UserRole + 1, false);
         m_sidebarList->addItem(inboxItem);
+
+        auto* expItem = new QListWidgetItem("  🧭 Music Explorer");
+        expItem->setData(Qt::UserRole, "__explorer__");
+        expItem->setData(Qt::UserRole + 1, false);
+        m_sidebarList->addItem(expItem);
     }
 
     addHeader("COLLECTIONS");
@@ -1325,6 +1544,7 @@ void MainWindow::activateCollection(const QString& id) {
             m_sortCombo->blockSignals(true);
             m_artZoomSlider->blockSignals(true);
             m_colBrowserBtn->blockSignals(true);
+            m_groupByFolderBtn->blockSignals(true);
 
             m_viewModeCombo->setCurrentIndex(static_cast<int>(c.viewMode));
             m_sortCombo->setCurrentIndex(static_cast<int>(c.sortOrder));
@@ -1332,12 +1552,15 @@ void MainWindow::activateCollection(const QString& id) {
             m_albumGrid->setArtworkSize(c.artworkSize);
             m_colBrowserBtn->setChecked(c.showColumnBrowser);
             m_colBrowser->setVisible(c.showColumnBrowser);
+            m_groupByFolderBtn->setChecked(c.groupByFolder);
             m_editColBtn->setEnabled(!c.isSystem);
 
             m_viewModeCombo->blockSignals(false);
             m_sortCombo->blockSignals(false);
             m_artZoomSlider->blockSignals(false);
             m_colBrowserBtn->blockSignals(false);
+            m_groupByFolderBtn->blockSignals(false);
+            updateCurrentTabTitle(c.name);
             break;
         }
     }
@@ -1353,6 +1576,7 @@ void MainWindow::saveCurrentCollectionViewState() {
             c.sortOrder = static_cast<SortOrder>(m_sortCombo->currentData().toInt());
             c.artworkSize = m_artZoomSlider->value();
             c.showColumnBrowser = m_colBrowserBtn->isChecked();
+            c.groupByFolder = m_groupByFolderBtn->isChecked();
             m_db.saveCollection(c);
             break;
         }
@@ -1409,15 +1633,48 @@ void MainWindow::activatePlaylist(const QString& id) {
         }
     }
 
+    for (const auto& pl : m_playlists) {
+        if (pl.id == id) {
+            updateCurrentTabTitle(pl.name);
+            break;
+        }
+    }
     refreshCurrentView(false);
 }
 
 void MainWindow::refreshCurrentView(bool resetColumnBrowser) {
+    auto matchesAlpha = [this](const QString& text) -> bool {
+        if (m_alphaFilter.isEmpty()) return true;
+        const QString trimmed = text.trimmed();
+        if (trimmed.isEmpty()) return m_alphaFilter == "#";
+        const QChar first = trimmed.at(0).toUpper();
+        if (m_alphaFilter == "#") return !first.isLetter();
+        return first == m_alphaFilter.at(0);
+    };
+    auto filterTracksByAlpha = [&](const QVector<Track>& in, bool byTitle) {
+        if (m_alphaFilter.isEmpty()) return in;
+        QVector<Track> out;
+        for (const Track& t : in) {
+            const QString key = byTitle ? t.title : (!t.albumArtist.isEmpty() ? t.albumArtist : t.artist);
+            if (matchesAlpha(key)) out.append(t);
+        }
+        return out;
+    };
+    auto filterAlbumsByAlpha = [&](const QVector<Album>& in, bool byAlbum) {
+        if (m_alphaFilter.isEmpty()) return in;
+        QVector<Album> out;
+        for (const Album& a : in) {
+            const QString key = byAlbum ? a.album : a.albumArtist;
+            if (matchesAlpha(key)) out.append(a);
+        }
+        return out;
+    };
+
     if (m_viewingInbox) {
         m_artZoomSlider->setVisible(false);
         closeAlbumDrawer();
         m_viewStack->setCurrentWidget(m_trackTable);
-        const auto inTracks = m_db.queryInboxTracks(m_searchEdit->text());
+        const auto inTracks = filterTracksByAlpha(m_db.queryInboxTracks(m_searchEdit->text()), false);
         m_trackTable->setTracks(inTracks);
         updateStatusSelection(QString("%1 tracks in Inbox").arg(inTracks.size()));
         return;
@@ -1427,7 +1684,7 @@ void MainWindow::refreshCurrentView(bool resetColumnBrowser) {
         m_artZoomSlider->setVisible(false);
         closeAlbumDrawer();
         m_viewStack->setCurrentWidget(m_trackTable);
-        const auto plTracks = m_db.queryPlaylistTracks(m_activePlaylistId, m_searchEdit->text());
+        const auto plTracks = filterTracksByAlpha(m_db.queryPlaylistTracks(m_activePlaylistId, m_searchEdit->text()), false);
         m_trackTable->setTracks(plTracks);
         updateStatusSelection(QString("%1 tracks in playlist").arg(plTracks.size()));
         return;
@@ -1458,24 +1715,93 @@ void MainWindow::refreshCurrentView(bool resetColumnBrowser) {
         closeAlbumDrawer();
     }
 
+    const bool groupByFolder = m_groupByFolderBtn && m_groupByFolderBtn->isChecked();
+    const bool alphaByAlbum = (sort == SortOrder::AlbumTitle) || groupByFolder;
+    const bool alphaByTitle = (sort == SortOrder::TrackTitle);
+
     if (mode == ViewMode::AlbumCovers) {
         m_viewStack->setCurrentWidget(m_albumGrid);
         m_albumGrid->setAvailableAlbumTypes(m_db.distinctAlbumTypes());
-        const auto albums = m_db.queryAlbums(rules, search, sort);
+        const auto rawAlbums = groupByFolder
+                                   ? m_db.queryFoldersAsAlbums(rules, search, sort)
+                                   : m_db.queryAlbums(rules, search, sort);
+        const auto albums = filterAlbumsByAlpha(rawAlbums, alphaByAlbum);
         m_albumGrid->setAlbums(albums);
-        updateStatusSelection(QString("%1 albums").arg(albums.size()));
+        updateStatusSelection(QString("%1 %2").arg(albums.size()).arg(groupByFolder ? "folders" : "albums"));
     } else if (mode == ViewMode::AlbumAndTracks) {
         m_viewStack->setCurrentWidget(m_albumTracks);
-        const auto albums = m_db.queryAlbums(rules, search, sort);
+        const auto rawAlbums = groupByFolder
+                                   ? m_db.queryFoldersAsAlbums(rules, search, sort)
+                                   : m_db.queryAlbums(rules, search, sort);
+        const auto albums = filterAlbumsByAlpha(rawAlbums, alphaByAlbum);
         const auto tracks = m_db.queryTracks(rules, search, sort, QString(), QString(), active.limitCount, active.limitOrder);
         m_albumTracks->setData(albums, tracks);
-        updateStatusSelection(QString("%1 albums, %2 tracks").arg(albums.size()).arg(tracks.size()));
+        updateStatusSelection(QString("%1 %2, %3 tracks")
+                                  .arg(albums.size())
+                                  .arg(groupByFolder ? "folders" : "albums")
+                                  .arg(tracks.size()));
     } else {
         m_viewStack->setCurrentWidget(m_trackTable);
-        const auto tracks = m_db.queryTracks(rules, search, sort, QString(), QString(), active.limitCount, active.limitOrder);
+        const auto tracks = filterTracksByAlpha(
+            m_db.queryTracks(rules, search, sort, QString(), QString(), active.limitCount, active.limitOrder),
+            alphaByTitle);
         m_trackTable->setTracks(tracks);
         updateStatusSelection(QString("%1 tracks").arg(tracks.size()));
     }
+}
+
+QVector<Track> MainWindow::queryTracksForAlbum(const Collection& active, const Album& album) const {
+    const RuleGroup rules = effectiveRules(active);
+    const QString search = m_searchEdit ? m_searchEdit->text() : QString();
+    if (!album.folderPath.isEmpty()) {
+        return m_db.queryTracksInFolder(rules, search, album.folderPath);
+    }
+    return m_db.queryTracks(rules, search, SortOrder::AlbumArtistYear, album.album, album.albumArtist);
+}
+
+void MainWindow::groupTracksAsSinglesChart(const QVector<Track>& tracks) {
+    if (tracks.isEmpty()) return;
+
+    const QString sampleFolder = QFileInfo(tracks.first().path).dir().dirName();
+    const auto ans = QMessageBox::question(
+        this,
+        "Group as Singles Chart",
+        QString("Tag %1 selected track(s) as a Singles Chart using their parent folder name?\n\n"
+                "• Album → parent folder name (e.g. \"%2\")\n"
+                "• Album Artist → Various Artists\n"
+                "• Compilation → Yes\n"
+                "• Album Type → Singles Chart\n\n"
+                "Track Artist and Title tags will be preserved.")
+            .arg(tracks.size())
+            .arg(sampleFolder),
+        QMessageBox::Yes | QMessageBox::Cancel,
+        QMessageBox::Yes);
+    if (ans != QMessageBox::Yes) return;
+
+    QVector<Track> updated;
+    updated.reserve(tracks.size());
+    int diskOk = 0;
+    for (Track t : tracks) {
+        if (t.path.isEmpty() || t.path.startsWith("http", Qt::CaseInsensitive)) continue;
+        const QString folderName = QFileInfo(t.path).dir().dirName();
+        if (!folderName.isEmpty()) {
+            t.album = folderName;
+        }
+        t.albumArtist = "Various Artists";
+        t.isCompilation = true;
+        t.albumType = "Singles Chart";
+        if (writeTrackTagsToFile(t)) {
+            ++diskOk;
+        }
+        updated.append(t);
+    }
+    if (updated.isEmpty()) return;
+
+    m_db.upsertTracks(updated);
+    refreshCurrentView(true);
+    updateStatusSelection(QString("Grouped %1 track(s) as Singles Chart (%2 written to file tags)")
+                              .arg(updated.size())
+                              .arg(diskOk));
 }
 
 void MainWindow::openAlbumDrawer(const Album& album) {
@@ -1488,13 +1814,14 @@ void MainWindow::openAlbumDrawer(const Album& album) {
     }
 
     m_drawerAlbum = album;
-    m_drawerTracks = m_db.queryTracks(effectiveRules(active), m_searchEdit->text(),
-                                      SortOrder::AlbumArtistYear, album.album, album.albumArtist);
-    std::sort(m_drawerTracks.begin(), m_drawerTracks.end(), [](const Track& x, const Track& y) {
-        if (x.discNumber != y.discNumber) return x.discNumber < y.discNumber;
-        if (x.trackNumber != y.trackNumber) return x.trackNumber < y.trackNumber;
-        return x.title.compare(y.title, Qt::CaseInsensitive) < 0;
-    });
+    m_drawerTracks = queryTracksForAlbum(active, album);
+    if (album.folderPath.isEmpty()) {
+        std::sort(m_drawerTracks.begin(), m_drawerTracks.end(), [](const Track& x, const Track& y) {
+            if (x.discNumber != y.discNumber) return x.discNumber < y.discNumber;
+            if (x.trackNumber != y.trackNumber) return x.trackNumber < y.trackNumber;
+            return x.title.compare(y.title, Qt::CaseInsensitive) < 0;
+        });
+    }
 
     m_drawerArt->setPixmap(m_artCache->getFullArtwork(album.artHash, 160));
     m_drawerTitle->setText(album.album);
@@ -1711,18 +2038,36 @@ void MainWindow::setupTrayAndMpris(const QString& artCacheDir) {
 
 void MainWindow::playTrackAtIndex(int index) {
     if (index < 0 || index >= m_queue.size()) return;
+    if (m_queueIndex >= 0 && m_queueIndex < m_queue.size() && m_queueIndex != index) {
+        if (m_currentDurationSec >= 600.0 || m_queue[m_queueIndex].format == "PODCAST") {
+            m_db.saveResumePosition(m_queue[m_queueIndex].path, m_currentPosSec);
+        }
+    }
     m_queueIndex = index;
     const Track& t = m_queue[m_queueIndex];
     m_currentPosSec = 0.0;
+    m_lastResumeSavedSec = 0.0;
+    const double resumeSec = m_db.loadResumePosition(t.path);
     if (m_castingActive) {
-        m_cast->playTrack(t, artFileForHash(t.artHash), 0.0);
+        m_cast->playTrack(t, artFileForHash(t.artHash), resumeSec > 5.0 ? resumeSec : 0.0);
     } else {
         m_audio->playFile(t.path);
+        if (resumeSec > 5.0) {
+            const QString targetPath = t.path;
+            QTimer::singleShot(350, this, [this, resumeSec, targetPath]() {
+                if (m_queueIndex >= 0 && m_queueIndex < m_queue.size() &&
+                    m_queue[m_queueIndex].path == targetPath) {
+                    activeSeekSeconds(resumeSec);
+                    m_scanStatusLabel->setText(QString("Resumed at %1").arg(formatSec(resumeSec)));
+                }
+            });
+        }
     }
     m_db.incrementPlayCount(t.path);
     m_trackStartedEpoch = QDateTime::currentSecsSinceEpoch();
     m_scrobbledCurrent = false;
     if (m_scrobble) m_scrobble->sendNowPlaying(t);
+    if (m_explorerPage) m_explorerPage->onNowPlayingTrackChanged(t);
     updateNowPlayingPanel(t);
     if (m_autoDj) {
         fillAutoDjQueue(false);
@@ -1825,11 +2170,94 @@ void MainWindow::playNext() {
         if (m_queueIndex + 1 < m_queue.size()) {
             playTrackAtIndex(m_queueIndex + 1);
         }
+    } else if (m_continueNextAlbum && playNextAlbumInCollection()) {
+        return;
     } else if (m_repeat) {
         playTrackAtIndex(0);
     } else {
         activeStop();
     }
+}
+
+bool MainWindow::playNextAlbumInCollection() {
+    if (m_queue.isEmpty() || m_queueIndex < 0 || m_queueIndex >= m_queue.size()) return false;
+
+    Collection active;
+    bool foundCol = false;
+    for (const auto& c : m_collections) {
+        if (c.id == m_activeCollectionId) {
+            active = c;
+            foundCol = true;
+            break;
+        }
+    }
+    if (!foundCol && !m_collections.isEmpty()) {
+        active = m_collections.first();
+    }
+
+    const auto sort = static_cast<SortOrder>(m_sortCombo->currentData().toInt());
+    const RuleGroup rules = effectiveRules(active);
+    const QString search = m_searchEdit ? m_searchEdit->text() : QString();
+    const bool groupByFolder = m_groupByFolderBtn && m_groupByFolderBtn->isChecked();
+    const QVector<Album> albums = groupByFolder
+                                      ? m_db.queryFoldersAsAlbums(rules, search, sort)
+                                      : m_db.queryAlbums(rules, search, sort);
+    if (albums.isEmpty()) return false;
+
+    const Track& cur = m_queue[m_queueIndex];
+    int curIdx = -1;
+    if (groupByFolder) {
+        const QString curFolder = QFileInfo(cur.path).absolutePath();
+        for (int i = 0; i < albums.size(); ++i) {
+            if (albums[i].folderPath == curFolder) {
+                curIdx = i;
+                break;
+            }
+        }
+    } else {
+        const QString curAlbum = cur.album.isEmpty() ? QString("Unknown Album") : cur.album;
+        const QString curAlbumArtist = (cur.isCompilation || cur.albumArtist.compare("Various Artists", Qt::CaseInsensitive) == 0)
+                                           ? QString("Various Artists")
+                                           : (!cur.albumArtist.isEmpty() ? cur.albumArtist : cur.artist);
+
+        for (int i = 0; i < albums.size(); ++i) {
+            if (albums[i].album.compare(curAlbum, Qt::CaseInsensitive) == 0 &&
+                albums[i].albumArtist.compare(curAlbumArtist, Qt::CaseInsensitive) == 0) {
+                curIdx = i;
+                break;
+            }
+        }
+        if (curIdx < 0) {
+            for (int i = 0; i < albums.size(); ++i) {
+                if (albums[i].album.compare(curAlbum, Qt::CaseInsensitive) == 0) {
+                    curIdx = i;
+                    break;
+                }
+            }
+        }
+    }
+    if (curIdx < 0) return false;
+
+    int nextIdx = curIdx + 1;
+    if (nextIdx >= albums.size()) {
+        if (!m_repeat) return false;
+        nextIdx = 0;
+    }
+
+    const Album& nextAlb = albums[nextIdx];
+    QVector<Track> nextTracks = queryTracksForAlbum(active, nextAlb);
+    if (nextTracks.isEmpty()) return false;
+
+    if (nextAlb.folderPath.isEmpty()) {
+        std::sort(nextTracks.begin(), nextTracks.end(), [](const Track& x, const Track& y) {
+            if (x.discNumber != y.discNumber) return x.discNumber < y.discNumber;
+            if (x.trackNumber != y.trackNumber) return x.trackNumber < y.trackNumber;
+            return x.title.compare(y.title, Qt::CaseInsensitive) < 0;
+        });
+    }
+
+    playQueue(nextTracks, 0);
+    return true;
 }
 
 void MainWindow::playPrev() {
@@ -2506,6 +2934,7 @@ void MainWindow::rebuildLibraryMenu() {
     connect(delAct, &QAction::triggered, this, &MainWindow::onDeleteLibrary);
     m_libraryMenu->addSeparator();
     connect(m_libraryMenu->addAction("Manage Library Folders..."), &QAction::triggered, this, &MainWindow::openLibraryFoldersDialog);
+    connect(m_libraryMenu->addAction("Sync to USB / Portable Device..."), &QAction::triggered, this, &MainWindow::openDeviceSyncDialog);
 }
 
 void MainWindow::switchLibrary(const QString& id) {
@@ -2714,6 +3143,7 @@ void MainWindow::activateInbox() {
             break;
         }
     }
+    updateCurrentTabTitle("Inbox");
     refreshCurrentView(false);
 }
 
@@ -2725,6 +3155,188 @@ void MainWindow::onScanFolderToInbox() {
 
     activateInbox();
     m_scanner->startScan({dir}, true);
+}
+
+void MainWindow::openReplayGainScanner(const QVector<Track>& tracks) {
+    if (tracks.isEmpty()) return;
+    ReplayGainDialog dlg(tracks, this);
+    dlg.exec();
+}
+
+void MainWindow::openDeviceSyncDialog() {
+    DeviceSyncDialog dlg(&m_db, m_collections, m_playlists, this);
+    dlg.exec();
+}
+
+void MainWindow::openShortcutsDialog() {
+    ShortcutsDialog dlg(this);
+    if (dlg.exec() == QDialog::Accepted) {
+        reloadShortcuts();
+    }
+}
+
+void MainWindow::setupShortcuts() {
+    auto addSc = [&](const QString& id, const QString& defKey, std::function<void()> fn) {
+        auto* sc = new QShortcut(ShortcutsDialog::loadShortcut(id, defKey), this);
+        sc->setContext(Qt::WindowShortcut);
+        connect(sc, &QShortcut::activated, this, [this, id, fn]() {
+            if (id == "play_pause" && qobject_cast<QLineEdit*>(focusWidget())) return;
+            fn();
+        });
+        m_shortcuts.insert(id, sc);
+    };
+
+    addSc("play_pause", "Space", [this]() { activeTogglePause(); });
+    addSc("next_track", "Ctrl+Right", [this]() { playNext(); });
+    addSc("prev_track", "Ctrl+Left", [this]() { playPrev(); });
+    addSc("vol_up", "Ctrl+Up", [this]() { m_volumeSlider->setValue(qMin(100, m_volumeSlider->value() + 5)); });
+    addSc("vol_down", "Ctrl+Down", [this]() { m_volumeSlider->setValue(qMax(0, m_volumeSlider->value() - 5)); });
+    addSc("seek_fwd", "Alt+Right", [this]() { activeSeekSeconds(m_currentPosSec + 10.0); });
+    addSc("seek_back", "Alt+Left", [this]() { activeSeekSeconds(qMax(0.0, m_currentPosSec - 10.0)); });
+    addSc("focus_search", "Ctrl+F", [this]() {
+        m_searchEdit->setFocus();
+        m_searchEdit->selectAll();
+    });
+    addSc("add_bookmark", "Ctrl+B", [this]() { addBookmarkAtCurrentPos(); });
+    addSc("new_tab", "Ctrl+T", [this]() { openNewBrowseTab(); });
+    addSc("close_tab", "Ctrl+W", [this]() {
+        if (m_browseTabs && m_browseTabs->count() > 1) closeBrowseTab(m_browseTabs->currentIndex());
+    });
+    addSc("theater_mode", "F11", [this]() { enterTheaterMode(); });
+    addSc("mini_player", "Ctrl+M", [this]() { enterMiniPlayer(); });
+}
+
+void MainWindow::reloadShortcuts() {
+    for (const auto& d : ShortcutsDialog::definitions()) {
+        if (m_shortcuts.contains(d.id)) {
+            m_shortcuts[d.id]->setKey(ShortcutsDialog::loadShortcut(d.id, d.defaultKey));
+        }
+    }
+}
+
+void MainWindow::addBookmarkAtCurrentPos() {
+    if (m_queueIndex < 0 || m_queueIndex >= m_queue.size()) return;
+    const Track& t = m_queue[m_queueIndex];
+    bool ok = false;
+    const QString defLabel = QString("Bookmark @ %1").arg(formatSec(m_currentPosSec));
+    const QString label = QInputDialog::getText(
+        this, "Add Bookmark",
+        QString("Bookmark label for \"%1\" at %2:").arg(t.title, formatSec(m_currentPosSec)),
+        QLineEdit::Normal, defLabel, &ok).trimmed();
+    if (!ok || label.isEmpty()) return;
+
+    m_db.addBookmark(t.path, m_currentPosSec, label);
+    m_scanStatusLabel->setText(QString("Saved bookmark: %1").arg(label));
+}
+
+void MainWindow::rebuildBookmarksMenu(QMenu* menu) {
+    menu->clear();
+    const bool hasTrack = (m_queueIndex >= 0 && m_queueIndex < m_queue.size());
+    QAction* addAct = menu->addAction("Add Bookmark at Current Time... (Ctrl+B)");
+    addAct->setEnabled(hasTrack);
+    connect(addAct, &QAction::triggered, this, &MainWindow::addBookmarkAtCurrentPos);
+
+    if (!hasTrack) return;
+    const auto bms = m_db.loadBookmarks(m_queue[m_queueIndex].path);
+    menu->addSeparator();
+    if (bms.isEmpty()) {
+        QAction* none = menu->addAction("No bookmarks for this track");
+        none->setEnabled(false);
+        return;
+    }
+
+    for (const auto& b : bms) {
+        QAction* act = menu->addAction(QString("🔖 %1  (%2)").arg(b.label, formatSec(b.positionSec)));
+        connect(act, &QAction::triggered, this, [this, pos = b.positionSec]() {
+            activeSeekSeconds(pos);
+        });
+    }
+    menu->addSeparator();
+    QAction* clearAct = menu->addAction("Clear Bookmarks for This Track");
+    connect(clearAct, &QAction::triggered, this, [this, bms]() {
+        for (const auto& b : bms) m_db.deleteBookmark(b.id);
+    });
+}
+
+void MainWindow::saveCurrentTabState() {
+    if (!m_browseTabs || m_switchingTab) return;
+    const int idx = m_browseTabs->currentIndex();
+    if (idx < 0 || idx >= m_tabStates.size()) return;
+
+    BrowseTabState& st = m_tabStates[idx];
+    st.collectionId = m_activeCollectionId;
+    st.playlistId = m_activePlaylistId;
+    st.isInbox = m_viewingInbox;
+    st.isRadio = (m_viewStack && m_viewStack->currentWidget() == m_radioPage);
+    st.isPodcasts = (m_viewStack && m_viewStack->currentWidget() == m_podcastPage);
+    st.isExplorer = (m_viewStack && m_viewStack->currentWidget() == m_explorerPage);
+    st.searchText = m_searchEdit ? m_searchEdit->text() : QString();
+    st.title = m_browseTabs->tabText(idx);
+}
+
+void MainWindow::updateCurrentTabTitle(const QString& title) {
+    if (!m_browseTabs || m_switchingTab) return;
+    const int idx = m_browseTabs->currentIndex();
+    if (idx >= 0 && idx < m_tabStates.size()) {
+        m_browseTabs->setTabText(idx, title);
+        m_tabStates[idx].title = title;
+        saveCurrentTabState();
+    }
+}
+
+void MainWindow::openNewBrowseTab(const QString& title) {
+    if (!m_browseTabs) return;
+    saveCurrentTabState();
+    BrowseTabState st;
+    st.title = title;
+    st.collectionId = !m_collections.isEmpty() ? m_collections.first().id : QString();
+    m_switchingTab = true;
+    m_tabStates.append(st);
+    const int newIdx = m_browseTabs->addTab(title);
+    m_browseTabs->setCurrentIndex(newIdx);
+    m_switchingTab = false;
+    restoreBrowseTab(newIdx);
+}
+
+void MainWindow::closeBrowseTab(int index) {
+    if (!m_browseTabs || m_browseTabs->count() <= 1) return;
+    if (index < 0 || index >= m_tabStates.size()) return;
+    m_switchingTab = true;
+    m_tabStates.removeAt(index);
+    m_browseTabs->removeTab(index);
+    m_switchingTab = false;
+    restoreBrowseTab(m_browseTabs->currentIndex());
+}
+
+void MainWindow::restoreBrowseTab(int index) {
+    if (index < 0 || index >= m_tabStates.size()) return;
+    const BrowseTabState st = m_tabStates[index];
+    m_switchingTab = true;
+    if (m_searchEdit) {
+        m_searchEdit->blockSignals(true);
+        m_searchEdit->setText(st.searchText);
+        m_searchEdit->blockSignals(false);
+    }
+    if (st.isInbox) {
+        activateInbox();
+    } else if (st.isRadio) {
+        m_viewingInbox = false;
+        if (m_inboxBar) m_inboxBar->setVisible(false);
+        m_viewStack->setCurrentWidget(m_radioPage);
+    } else if (st.isPodcasts) {
+        m_viewingInbox = false;
+        if (m_inboxBar) m_inboxBar->setVisible(false);
+        m_viewStack->setCurrentWidget(m_podcastPage);
+    } else if (st.isExplorer) {
+        m_viewingInbox = false;
+        if (m_inboxBar) m_inboxBar->setVisible(false);
+        m_viewStack->setCurrentWidget(m_explorerPage);
+    } else if (!st.playlistId.isEmpty()) {
+        activatePlaylist(st.playlistId);
+    } else if (!st.collectionId.isEmpty()) {
+        activateCollection(st.collectionId);
+    }
+    m_switchingTab = false;
 }
 
 } // namespace honeycomb

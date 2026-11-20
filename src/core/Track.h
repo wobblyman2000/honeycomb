@@ -41,6 +41,7 @@ struct Album {
     int64_t totalDurationMs = 0;
     QString artHash;
     QString firstTrackPath;
+    QString folderPath; // populated when grouped by parent folder
 };
 
 } // namespace honeycomb
